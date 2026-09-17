@@ -1,0 +1,50 @@
+{
+  "engine_version": "0.1.0",
+  "date": {
+    "abt_years": 5,
+    "est_years": 10,
+    "cal_years": 2,
+    "open_interval_fallback_years": 40,
+    "pre_1752_widen_days": 11
+  },
+  "presence": {
+    "point_event_dwell_days": 30,
+    "transit_event_window_days": 14,
+    "min_presence_conf": 0.5
+  },
+  "place": {
+    "radius_km_by_tier": {
+      "address": 1,
+      "locality": 10,
+      "district": 50,
+      "region": 250,
+      "country": 0
+    },
+    "min_tier": "district",
+    "proximity_radius_multiplier": 1.25,
+    "min_geocode_conf": 0.4
+  },
+  "kinship": {
+    "close_kin_cutoff": 4,
+    "in_law_cutoff": 3,
+    "generations_cutoff": 3,
+    "branch_cutoff": 6,
+    "bfs_max_depth": 10
+  },
+  "scoring": {
+    "weights": {
+      "proximity": 1.0,
+      "temporal": 1.0,
+      "precision": 1.0,
+      "confidence": 1.0,
+      "unrelatedness": 1.0,
+      "independence": 0.8
+    },
+    "score_threshold": 0.35,
+    "max_candidates": 500
+  },
+  "privacy": {
+    "include_living": false,
+    "living_cutoff_year": 1935
+  }
+}
