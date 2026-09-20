@@ -15,8 +15,8 @@ export function projectWindow(dateStart: string, dateEnd: string, eventType: str
   const days = type === "IMMI" || type === "EMIG" ? transitDays : pointDays;
   return { start: addDays(dateStart, -days), end: addDays(dateEnd, days) };
 }
-export function clampToLifespan(window: DateWindow, lifespan: LifespanWindow): DateWindow | null {
-  const start = lifespan.birthStart !== null && lifespan.birthStart > window.start ? lifespan.birthStart : window.start;
-  const end = lifespan.deathEnd !== null && lifespan.deathEnd < window.end ? lifespan.deathEnd : window.end;
+export function clampToLifespan(interval: DateWindow, lifespan: LifespanWindow): DateWindow | null {
+  const start = lifespan.birthStart !== null && lifespan.birthStart > interval.start ? lifespan.birthStart : interval.start;
+  const end = lifespan.deathEnd !== null && lifespan.deathEnd < interval.end ? lifespan.deathEnd : interval.end;
   return start <= end ? { start, end } : null;
 }
