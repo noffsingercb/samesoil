@@ -1,28 +1,6 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import type { ArtifactSinkAdapter, FileSourceAdapter, GedcomEncoding, GedcomSource } from "../../core/adapters.js";
-
-function encodingHint(bytes: Uint8Array): GedcomEncoding {
-  if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) return "UTF-8";
-  if ((bytes[0] === 0xff && bytes[1] === 0xfe) || (bytes[0] === 0xfe && bytes[1] === 0xff)) return "UTF-16";
-  return "unknown";
-}
-export class NodeFileSourceAdapter implements FileSourceAdapter {
-  public async readGedcom(path: string): Promise<GedcomSource> {
-    const bytes = new Uint8Array(await readFile(path));
-    return { bytes, encodingHint: encodingHint(bytes) };
-  }
-  public async readText(path: string): Promise<string> { return readFile(path, "utf8"); }
-}
-export class NodeArtifactSinkAdapter implements ArtifactSinkAdapter {
-  readonly #directory: string;
-  public constructor(directory: string) { this.#directory = resolve(directory); }
-  public async write(name: string, data: string | Uint8Array): Promise<void> {
-    const outputPath = resolve(this.#directory, name);
-    if (!outputPath.startsWith(`${this.#directory}/`) && outputPath !== this.#directory) {
-      throw new Error(`Artifact path escapes output directory: ${name}`);
-    }
-    await mkdir(dirname(outputPath), { recursive: true });
-    await writeFile(outputPath, data);
-  }
-}
+function encodingHint(bytes: Uint8Array): GedcomEncoding { if (bytes[0]===0xef&&bytes[1]===0xbb&&bytes[2]===0xbf)return"UTF-8";if((bytes[0]===0xff&&bytes[1]===0xfe)||(bytes[0]===0xfe&&bytes[1]===0xff))return"UTF-16";return"unknown"; }
+export class NodeFileSourceAdapter implements FileSourceAdapter { public async readGedcom(path:string):Promise<GedcomSource>{const bytes=new Uint8Array(await readFile(path));return{bytes,encodingHint:encodingHint(bytes)}} public async readText(path:string):Promise<string>{return readFile(path,"utf8")} }
+export class NodeArtifactSinkAdapter implements ArtifactSinkAdapter { readonly #directory:string;public constructor(directory:string){this.#directory=resolve(directory)}public async write(name:string,data:string|Uint8Array):Promise<void>{const outputPath=resolve(this.#directory,name),relativePath=relative(this.#directory,outputPath);if(relativePath===""||relativePath===".."||relativePath.startsWith(`..${sep}`)||isAbsolute(relativePath))throw new Error(`Artifact path escapes output directory: ${name}`);await mkdir(dirname(outputPath),{recursive:true});await writeFile(outputPath,data)} }
