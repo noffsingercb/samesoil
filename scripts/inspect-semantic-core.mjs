@@ -1,0 +1,15 @@
+import Database from "better-sqlite3";
+const path = process.argv[2] ?? "tree.sqlite";
+const db = new Database(path, { readonly: true });
+try {
+  console.log("SEMANTIC CORE SUMMARY");
+  console.table([db.prepare(`SELECT (SELECT COUNT(*) FROM presence_intervals) AS presence_intervals,(SELECT COUNT(*) FROM candidate_pairs) AS candidate_pairs,(SELECT COUNT(*) FROM scored_candidates) AS scored_candidates,(SELECT COUNT(*) FROM suppression_log) AS suppressions`).get()]);
+  console.log("PRESENCE BY EVENT AND ROLE");
+  console.table(db.prepare(`SELECT e.event_type,pi.role,COUNT(*) AS intervals,ROUND(AVG(pi.presence_conf),3) AS mean_confidence FROM presence_intervals pi JOIN events e ON e.id=pi.event_id GROUP BY e.event_type,pi.role ORDER BY e.event_type,pi.role`).all());
+  console.log("SUPPRESSION REASONS");
+  console.table(db.prepare(`SELECT reason,COUNT(*) AS rows FROM suppression_log GROUP BY reason ORDER BY rows DESC,reason`).all());
+  console.log("SCORED TIERS");
+  console.table(db.prepare(`SELECT pa.precision_tier AS a_tier,pb.precision_tier AS b_tier,COUNT(*) AS rows,ROUND(MAX(sc.score),6) AS best_score FROM scored_candidates sc JOIN candidate_pairs c ON c.id=sc.candidate_id JOIN presence_intervals pa ON pa.id=c.a_interval_id JOIN presence_intervals pb ON pb.id=c.b_interval_id GROUP BY pa.precision_tier,pb.precision_tier ORDER BY rows DESC,a_tier,b_tier`).all());
+  console.log("INTEGRITY CHECKS");
+  console.table([db.prepare(`SELECT (SELECT COUNT(*) FROM presence_intervals pi JOIN individuals i ON i.id=pi.individual_id WHERE (i.birth_start IS NOT NULL AND pi.date_start<i.birth_start) OR (i.death_end IS NOT NULL AND pi.date_end>i.death_end)) AS presence_outside_lifespan,(SELECT COUNT(*) FROM candidate_pairs WHERE overlap_start>overlap_end OR overlap_days<=0) AS invalid_overlaps,(SELECT COUNT(*) FROM scored_candidates WHERE score<0 OR score>1 OR s_proximity<0 OR s_proximity>1 OR s_temporal<0 OR s_temporal>1 OR s_precision<0 OR s_precision>1 OR s_confidence<0 OR s_confidence>1 OR s_unrelatedness<0 OR s_unrelatedness>1 OR s_independence<0 OR s_independence>1) AS invalid_score_components,(SELECT COUNT(*) FROM scored_candidates sc JOIN candidate_pairs c ON c.id=sc.candidate_id JOIN individuals a ON a.id=c.a_id JOIN individuals b ON b.id=c.b_id WHERE a.is_living<>0 OR b.is_living<>0) AS living_rows_scored,(SELECT COUNT(*) FROM scored_candidates sc JOIN candidate_pairs c ON c.id=sc.candidate_id JOIN kinship_distance k ON k.a_id=MIN(c.a_id,c.b_id) AND k.b_id=MAX(c.a_id,c.b_id) WHERE (k.blood_degree IS NOT NULL AND k.blood_degree<=4) OR (k.graph_degree IS NOT NULL AND k.graph_degree<=3)) AS close_kin_rows_scored`).get()]);
+} finally { db.close(); }
