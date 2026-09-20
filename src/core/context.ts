@@ -15,6 +15,7 @@ export interface EngineContext {
   readonly artifactSink: ArtifactSinkAdapter;
   readonly progress: ProgressReporter;
   readonly env: EnvAdapter;
+  readonly inputPath?: string;
   readonly placeProvider?: PlaceProviderAdapter;
   readonly contextProvider?: ContextProviderAdapter;
   readonly config: SamesoilConfig;

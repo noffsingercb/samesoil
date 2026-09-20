@@ -1,4 +1,145 @@
 import type { EngineContext } from "../core/context.js";
-export async function run(_ctx: EngineContext): Promise<void> {
-  throw new Error("NotImplemented: dates pass");
+import { normalizeGedcomDate, type LifespanBounds, type NormalizedDate } from "../core/date-normalizer.js";
+
+interface EventRow extends Readonly<Record<string, unknown>> {
+  readonly id: number;
+  readonly subject_type: string;
+  readonly subject_id: number;
+  readonly event_type: string;
+  readonly date_raw: string | null;
+}
+interface PersonRow extends Readonly<Record<string, unknown>> {
+  readonly id: number;
+  readonly birth_start: string | null;
+  readonly death_end: string | null;
+}
+
+function merge(bounds: LifespanBounds, value: NormalizedDate, type: "birth" | "death"): LifespanBounds {
+  return type === "birth"
+    ? { start: bounds.start === null || value.dateStart < bounds.start ? value.dateStart : bounds.start, end: bounds.end }
+    : { start: bounds.start, end: bounds.end === null || value.dateEnd > bounds.end ? value.dateEnd : bounds.end };
+}
+
+function addToIndex(index: Map<number, EventRow[]>, event: EventRow): void {
+  const existing = index.get(event.subject_id);
+  if (existing === undefined) index.set(event.subject_id, [event]);
+  else existing.push(event);
+}
+
+export async function run(ctx: EngineContext): Promise<void> {
+  ctx.progress.passStarted("dates");
+  const events = ctx.storage.all<EventRow>(
+    "SELECT id,subject_type,subject_id,event_type,date_raw FROM events ORDER BY id"
+  );
+  const people = ctx.storage.all<PersonRow>(
+    "SELECT id,birth_start,death_end FROM individuals ORDER BY id"
+  );
+
+  const individualEvents = new Map<number, EventRow[]>();
+  const familyMarriages: EventRow[] = [];
+  for (const event of events) {
+    if (event.subject_type === "individual") addToIndex(individualEvents, event);
+    else if (event.subject_type === "family" && event.event_type === "MARR") familyMarriages.push(event);
+  }
+
+  const bounds = new Map<number, LifespanBounds>(
+    people.map((person) => [person.id, { start: person.birth_start, end: person.death_end }])
+  );
+  for (const [personId, personEvents] of individualEvents) {
+    let personBounds = bounds.get(personId) ?? { start: null, end: null };
+    for (const event of personEvents) {
+      if (event.event_type !== "BIRT" && event.event_type !== "DEAT") continue;
+      const value = normalizeGedcomDate(event.date_raw, ctx.config.date).value;
+      if (value !== null && value.precision !== "inferred") {
+        personBounds = merge(personBounds, value, event.event_type === "BIRT" ? "birth" : "death");
+      }
+    }
+    bounds.set(personId, personBounds);
+  }
+
+  const normalized = new Map<number, NormalizedDate>();
+  let unparsed = 0;
+  let partial = 0;
+  let open = 0;
+  for (const event of events) {
+    const result = normalizeGedcomDate(
+      event.date_raw,
+      ctx.config.date,
+      event.subject_type === "individual"
+        ? (bounds.get(event.subject_id) ?? { start: null, end: null })
+        : { start: null, end: null }
+    );
+    if (result.value === null) {
+      unparsed += 1;
+      continue;
+    }
+    normalized.set(event.id, result.value);
+    if (result.value.parseStatus === "partial") partial += 1;
+    if (result.value.qualifier?.includes("BEF") || result.value.qualifier?.includes("AFT")) open += 1;
+  }
+  ctx.progress.progress("dates", events.length, events.length);
+
+  ctx.storage.transaction((): void => {
+    ctx.storage.run("DELETE FROM scored_candidates");
+    ctx.storage.run("DELETE FROM suppression_log");
+    ctx.storage.run("DELETE FROM candidate_pairs");
+    ctx.storage.run("DELETE FROM presence_intervals");
+    ctx.storage.run("DELETE FROM event_dates");
+
+    for (const event of events) {
+      const value = normalized.get(event.id);
+      if (value !== undefined) {
+        ctx.storage.run(
+          "INSERT INTO event_dates(event_id,date_start,date_end,precision,qualifier,parse_status) VALUES(?,?,?,?,?,?)",
+          [event.id, value.dateStart, value.dateEnd, value.precision, value.qualifier, value.parseStatus]
+        );
+      }
+    }
+
+    for (const person of people) {
+      const personEvents = individualEvents.get(person.id) ?? [];
+      const births: NormalizedDate[] = [];
+      const deaths: NormalizedDate[] = [];
+      for (const event of personEvents) {
+        const value = normalized.get(event.id);
+        if (value === undefined) continue;
+        if (event.event_type === "BIRT") births.push(value);
+        else if (event.event_type === "DEAT" || event.event_type === "BURI") deaths.push(value);
+      }
+      const birthStarts = births.map((value) => value.dateStart).sort();
+      const birthEnds = births.map((value) => value.dateEnd).sort();
+      const deathStarts = deaths.map((value) => value.dateStart).sort();
+      const deathEnds = deaths.map((value) => value.dateEnd).sort();
+      ctx.storage.run(
+        "UPDATE individuals SET birth_start=?,birth_end=?,death_start=?,death_end=?,lifespan_src=? WHERE id=?",
+        [
+          birthStarts[0] ?? null,
+          birthEnds.at(-1) ?? null,
+          deathStarts[0] ?? null,
+          deathEnds.at(-1) ?? null,
+          births.length > 0 || deaths.length > 0 ? "stated" : "unknown",
+          person.id
+        ]
+      );
+    }
+
+    for (const event of familyMarriages) {
+      const value = normalized.get(event.id);
+      if (value !== undefined) {
+        ctx.storage.run(
+          "UPDATE families SET marriage_start=?,marriage_end=? WHERE id=?",
+          [value.dateStart, value.dateEnd, event.subject_id]
+        );
+      }
+    }
+  });
+
+  if (unparsed > 0) ctx.progress.warn(`${unparsed} event dates were empty or unparseable`);
+  ctx.progress.passFinished("dates", {
+    eventsIn: events.length,
+    rowsOut: normalized.size,
+    unparsed,
+    partial,
+    clampedOpenIntervals: open
+  });
 }
