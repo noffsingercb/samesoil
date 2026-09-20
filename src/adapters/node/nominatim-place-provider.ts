@@ -21,11 +21,14 @@ function tierFor(result: NominatimResult): PrecisionTier {
 }
 function coordinate(value: string | undefined): number | null { if (value === undefined) return null; const parsed = Number(value); return Number.isFinite(parsed) ? parsed : null; }
 function confidence(value: number | undefined): number { if (value === undefined || !Number.isFinite(value)) return 0; return Math.max(0, Math.min(1, value)); }
+function delay(milliseconds: number): Promise<void> { return new Promise((resolve) => setTimeout(resolve, milliseconds)); }
 export class NominatimPlaceProvider implements PlaceProviderAdapter {
   readonly #endpoint: string;
   readonly #userAgent: string;
-  public constructor(endpoint = "https://nominatim.openstreetmap.org/search", userAgent = "samesoil/0.1") { this.#endpoint = endpoint; this.#userAgent = userAgent; }
+  readonly #delayMs: number;
+  public constructor(endpoint = "https://nominatim.openstreetmap.org/search", userAgent = "samesoil/0.1", delayMs = 0) { this.#endpoint = endpoint; this.#userAgent = userAgent; this.#delayMs = delayMs; }
   public async resolvePlace(rawString: string): Promise<PlaceResolution> {
+    if (this.#delayMs > 0) await delay(this.#delayMs);
     const request = buildNominatimRequest(this.#endpoint, this.#userAgent, rawString);
     const response = await fetch(request.url, request.init);
     if (!response.ok) throw new Error(`Nominatim request failed: HTTP ${response.status}`);
