@@ -2,18 +2,27 @@
 
 ## JUDGMENT CALLS
 
-- **Presence confidence configuration:** §6.3 says every confidence is configuration, while the existing config only exposed duration and minimum confidence. The normative event-role table is now represented under `presence.projections`; changing a role confidence changes only newly projected intervals.
-- **Point-event uncertainty:** dwell and transit windows expand the normalized date interval rather than replacing it. A year-precision transit record therefore remains year-uncertain plus the transit allowance; shrinking it to fourteen days would invent a date.
-- **Marriage parents:** a family marriage projects both spouses at subject confidence and the known parents of each spouse at parent confidence. If that is too speculative, remove the `parents` value from the `MARR` projection.
-- **Spouse projection:** RESI and CENS project known spouses because §6.3 explicitly assigns spouse confidence. Multiple or former spouses may be projected; Pass 6 suppresses direct spouse pairs, and same-event household projections are suppressed first.
-- **Spatial blocking:** Pass 5 uses deterministic latitude/longitude cells sized from configured place radii and compares adjacent cells and decades. It does not require a geohash dependency.
-- **Kinship timing:** Pass 5 computes and memoizes kinship only after temporal and distance checks pass, but does not suppress there. Pass 6 remains the sole owner of the ordered suppression policy.
-- **Temporal score:** because §7.3 requires both overlap reward and a one-day exact match to beat a decade-long vague overlap, temporal score combines a bounded overlap bonus with a dominant config-driven precision factor.
-- **Pair precision:** `s_precision` uses the worse of the two tiers. Thus a coarse endpoint can never borrow the other endpoint's finer precision.
-- **Geocode confidence pair:** §7.3 names one geocode confidence although a pair has two. The implementation uses their geometric mean, preserving symmetry and collapsing when either endpoint is zero.
-- **Source independence:** the schema stores source counts but not source identities. Same event or same GEDCOM line is treated as the same source record; distinct records receive the configured independent value. True cross-source identity needs schema support.
-- **Household identity:** exact shared event IDs are household evidence; separate census rows count as the same household only when they share a GEDCOM line and place. A household identifier would be more reliable.
+- **Presence confidence configuration:** the event-role table is represented under `presence.projections`; changing a role confidence changes only newly projected intervals.
+- **Point-event uncertainty:** dwell and transit windows expand the normalized date interval rather than replacing it. A year-precision record therefore remains year-uncertain plus its configured allowance.
+- **No lifetime residence invention:** Pass 4 still persists only evidence-based presence. Birthplace-to-next-event and last-event-to-death interpolation remain deferred because they would create unsupported residence claims and excessive pair growth.
+- **Decade-proximity discovery:** Pass 5 now admits actual interval overlaps plus evidence anchors whose nearest endpoints are at most `temporal_candidate_window_days` apart. The default is 3,653 days. Same and adjacent decade buckets make this bounded without scanning every person pair.
+- **Honest temporal language:** `overlap` candidates retain an actual overlap duration. `near` candidates store zero overlap and a positive `temporal_gap_days`; explanations say the records are a measured number of years apart rather than claiming simultaneous presence.
+- **Temporal ranking:** overlap duration or event gap produces `s_temporal_proximity`; date precision produces `s_date_precision`; their product remains `s_temporal`. Events within 366 days receive full proximity, followed by linear decay to the configured ten-year floor.
+- **Review depth:** the default score threshold is 0.15 and the deterministic review cap remains 500, allowing later-decade leads to survive while preserving strongest-first ranking.
+- **Marriage parents:** a family marriage projects both spouses at subject confidence and the known parents of each spouse at parent confidence. Remove the `parents` value from the `MARR` projection if that is too speculative.
+- **Spouse projection:** RESI and CENS project known spouses because the semantic specification assigns spouse confidence. Direct spouse pairs and same-event household projections are suppressed.
+- **Spatial blocking:** Pass 5 uses deterministic latitude/longitude cells sized from configured place radii and compares adjacent cells and same/adjacent decades. It does not require a geohash dependency.
+- **Kinship timing:** Pass 5 computes and memoizes kinship only after temporal and distance checks pass, but Pass 6 remains the sole owner of the ordered suppression policy.
+- **Pair precision:** `s_precision` uses the worse of the two place tiers. Geocode confidence uses the geometric mean, preserving symmetry and collapsing when either endpoint is zero.
 - **Candidate cap:** threshold suppression happens before deterministic score sorting. Rows beyond `max_candidates` are logged as `below_limit` rather than silently discarded.
+
+## SCHEMA CHANGES
+
+- `candidate_pairs.temporal_relation`: `overlap` or `near`.
+- `candidate_pairs.temporal_gap_days`: zero for overlap; positive endpoint-to-endpoint gap for near-event evidence.
+- `scored_candidates.s_temporal_proximity`: duration/gap contribution before date precision.
+- `scored_candidates.s_date_precision`: independent precision contribution.
+- Schema version `0.2.0` adds these columns in place, with defaults that preserve existing rows. The CLI runs the migration before every command.
 
 ## SCHEMA GAPS
 
@@ -22,5 +31,4 @@
 - `candidate_pairs` cannot store the blocking bucket or early-rejection audit details.
 - `suppression_log` has no `candidate_id`; candidate IDs are retained in `detail`.
 - `presence_intervals` does not store date precision or geocode confidence, so Pass 6 joins back through events, event dates, and places.
-- `scored_candidates` has no relationship-summary column; the deterministic summary is included in `explanation`.
-- Timing is report-only because the normative schema has no pass-run table.
+- Timing is report-only because the schema has no pass-run table.
