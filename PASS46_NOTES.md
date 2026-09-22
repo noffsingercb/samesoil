@@ -5,10 +5,12 @@
 - **Presence confidence configuration:** the event-role table is represented under `presence.projections`; changing a role confidence changes only newly projected intervals.
 - **Point-event uncertainty:** dwell and transit windows expand the normalized date interval rather than replacing it. A year-precision record therefore remains year-uncertain plus its configured allowance.
 - **No lifetime residence invention:** Pass 4 still persists only evidence-based presence. Birthplace-to-next-event and last-event-to-death interpolation remain deferred because they would create unsupported residence claims and excessive pair growth.
-- **Decade-proximity discovery:** Pass 5 now admits actual interval overlaps plus evidence anchors whose nearest endpoints are at most `temporal_candidate_window_days` apart. The default is 3,653 days. Same and adjacent decade buckets make this bounded without scanning every person pair.
-- **Honest temporal language:** `overlap` candidates retain an actual overlap duration. `near` candidates store zero overlap and a positive `temporal_gap_days`; explanations say the records are a measured number of years apart rather than claiming simultaneous presence.
+- **Decade-proximity discovery:** Pass 5 admits actual interval overlaps plus evidence anchors whose nearest endpoints are at most `temporal_candidate_window_days` apart. The default is 3,653 days. Same and adjacent decade buckets keep this bounded without scanning every person pair.
+- **Honest temporal language:** `overlap` candidates retain an actual overlap duration. `near` candidates store zero overlap and a positive `temporal_gap_days`; explanations state the measured gap rather than claiming simultaneous presence.
 - **Temporal ranking:** overlap duration or event gap produces `s_temporal_proximity`; date precision produces `s_date_precision`; their product remains `s_temporal`. Events within 366 days receive full proximity, followed by linear decay to the configured ten-year floor.
-- **Review depth:** the default score threshold is 0.15 and the deterministic review cap remains 500, allowing later-decade leads to survive while preserving strongest-first ranking.
+- **Person-pair consolidation:** after suppression and threshold scoring, only the highest-scoring evidence pair survives for each unordered pair of people. Additional evidence rows are logged as `duplicate_pair` with the retained candidate ID.
+- **Locality diversity:** review selection caps each normalized locality pair at `max_candidates_per_locality`, default 10. Excess rows are logged as `locality_limit`. This does not claim population knowledge or change a candidate's score; it prevents large-city evidence from crowding smaller localities out of the review set.
+- **Review depth:** the default score threshold is 0.15 and the deterministic global review cap remains 500. Pair consolidation and locality diversity happen before the global cap.
 - **Marriage parents:** a family marriage projects both spouses at subject confidence and the known parents of each spouse at parent confidence. Remove the `parents` value from the `MARR` projection if that is too speculative.
 - **Spouse projection:** RESI and CENS project known spouses because the semantic specification assigns spouse confidence. Direct spouse pairs and same-event household projections are suppressed.
 - **Spatial blocking:** Pass 5 uses deterministic latitude/longitude cells sized from configured place radii and compares adjacent cells and same/adjacent decades. It does not require a geohash dependency.
@@ -22,7 +24,7 @@
 - `candidate_pairs.temporal_gap_days`: zero for overlap; positive endpoint-to-endpoint gap for near-event evidence.
 - `scored_candidates.s_temporal_proximity`: duration/gap contribution before date precision.
 - `scored_candidates.s_date_precision`: independent precision contribution.
-- Schema version `0.2.0` adds these columns in place, with defaults that preserve existing rows. The CLI runs the migration before every command.
+- Schema version `0.2.0` added these columns in place. Engine version `0.2.1` adds pair consolidation and locality-diverse review selection without another schema change.
 
 ## SCHEMA GAPS
 
