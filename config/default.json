@@ -1,5 +1,5 @@
 {
-  "engine_version": "0.2.1",
+  "engine_version": "0.3.0",
   "date": { "abt_years": 5, "est_years": 10, "cal_years": 2, "open_interval_fallback_years": 40, "pre_1752_widen_days": 11 },
   "presence": {
     "point_event_dwell_days": 30,
@@ -33,6 +33,7 @@
     "weights": { "proximity": 1.0, "temporal": 1.0, "precision": 1.0, "confidence": 1.0, "unrelatedness": 1.0, "independence": 0.8 },
     "precision_tier_weights": { "address": 1.0, "locality": 0.85, "district": 0.5, "region": 0.2, "country": 0.0, "unknown": 0.0 },
     "temporal_precision_weights": { "day": 1.0, "month": 0.9, "year": 0.75, "decade": 0.35, "range": 0.5, "inferred": 0.25 },
+    "proximity_score_max_km": 25,
     "temporal_overlap_full_days": 30,
     "temporal_min_overlap_factor": 0.5,
     "temporal_candidate_window_days": 3653,
