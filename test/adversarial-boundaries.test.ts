@@ -1,4 +1,4 @@
-import assert from"node:assert/strict";import test from"node:test";import{haversineKm,longitudeCellCount,longitudeNeighborSpan,temporalBucketNeighborSpan,wrapCell,wrappedLongitudeCell}from"../src/core/candidates.js";
-test("ten-year temporal windows inspect two decade neighbors",()=>{assert.equal(temporalBucketNeighborSpan(3653),2)});
+import assert from"node:assert/strict";import test from"node:test";import{haversineKm,longitudeCellCount,longitudeNeighborSpan,temporalSearchYears,wrapCell,wrappedLongitudeCell}from"../src/core/candidates.js";
+test("ten-year temporal search includes two-decade boundary without blanket decade expansion",()=>{const searched=temporalSearchYears({start:"1899-12-31",end:"1899-12-31"},3653);assert.ok(searched.includes(1910));assert.ok(searched.includes(1889));assert.ok(searched.length<30)});
 test("longitude cells wrap across the antimeridian",()=>{const step=1,count=longitudeCellCount(step),east=wrappedLongitudeCell(179.95,step),west=wrappedLongitudeCell(-179.95,step);assert.equal(wrapCell(east+1,count),west);assert.ok(haversineKm(0,179.95,0,-179.95)<12)});
 test("high-latitude search expands rather than using a cosine floor",()=>{const count=longitudeCellCount(0.25);assert.ok(longitudeNeighborSpan(89,count)>10)});

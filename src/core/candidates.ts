@@ -1,11 +1,12 @@
 import { inclusiveDays } from "./presence.js";
 export interface TemporalInterval{readonly start:string;readonly end:string}export interface TemporalOverlap{readonly start:string;readonly end:string;readonly days:number}export type TemporalRelation="overlap"|"near";export interface TemporalMatch{readonly relation:TemporalRelation;readonly start:string;readonly end:string;readonly overlapDays:number;readonly gapDays:number}
-const EARTH_RADIUS_KM=6371.0088,MEAN_DAYS_PER_YEAR=365.2425;
+const EARTH_RADIUS_KM=6371.0088;
 export function overlap(a:TemporalInterval,b:TemporalInterval):TemporalOverlap|null{const start=a.start>b.start?a.start:b.start,end=a.end<b.end?a.end:b.end;return start<=end?{start,end,days:inclusiveDays(start,end)}:null}
 export function temporalMatch(a:TemporalInterval,b:TemporalInterval,maxGapDays:number):TemporalMatch|null{const shared=overlap(a,b);if(shared!==null)return{relation:"overlap",start:shared.start,end:shared.end,overlapDays:shared.days,gapDays:0};const earlier=a.end<b.start?a:b,later=earlier===a?b:a,gapDays=Math.max(1,inclusiveDays(earlier.end,later.start)-1);return gapDays<=maxGapDays?{relation:"near",start:earlier.end,end:later.start,overlapDays:0,gapDays}:null}
 export function haversineKm(aLat:number,aLon:number,bLat:number,bLon:number):number{const radians=Math.PI/180,dLat=(bLat-aLat)*radians,dLon=(bLon-aLon)*radians,lat1=aLat*radians,lat2=bLat*radians,h=Math.sin(dLat/2)**2+Math.cos(lat1)*Math.cos(lat2)*Math.sin(dLon/2)**2;return EARTH_RADIUS_KM*2*Math.atan2(Math.sqrt(h),Math.sqrt(1-h))}
-export function decades(start:string,end:string):ReadonlyArray<number>{const first=Math.floor(Number(start.slice(0,4))/10),last=Math.floor(Number(end.slice(0,4))/10),values:number[]=[];for(let value=first;value<=last;value+=1)values.push(value);return values}
-export function temporalBucketNeighborSpan(maxGapDays:number):number{return Math.max(0,Math.ceil(maxGapDays/(MEAN_DAYS_PER_YEAR*10)))}
+export function years(start:string,end:string):ReadonlyArray<number>{const first=Number(start.slice(0,4)),last=Number(end.slice(0,4)),values:number[]=[];for(let value=first;value<=last;value+=1)values.push(value);return values}
+export function shiftIsoDate(value:string,days:number):string{const instant=new Date(`${value}T00:00:00.000Z`);instant.setUTCDate(instant.getUTCDate()+days);return instant.toISOString().slice(0,10)}
+export function temporalSearchYears(interval:TemporalInterval,maxGapDays:number):ReadonlyArray<number>{return years(shiftIsoDate(interval.start,-maxGapDays),shiftIsoDate(interval.end,maxGapDays))}
 export function longitudeCellCount(degreeStep:number):number{return Math.max(1,Math.ceil(360/degreeStep))}
 export function wrappedLongitudeCell(longitude:number,degreeStep:number):number{const count=longitudeCellCount(degreeStep),normalized=((longitude+180)%360+360)%360;return Math.min(count-1,Math.floor(normalized/degreeStep))}
 export function wrapCell(cell:number,count:number):number{return((cell%count)+count)%count}
