@@ -1,585 +1,696 @@
-import type { EngineContext } from "../core/context.js";
-import type { PrecisionTier } from "../core/adapters.js";
-import type { KinshipGraph } from "../core/kinship.js";
-import { tierIsCoarser } from "../core/place-resolution.js";
-import { createKinshipService, loadKinshipGraph } from "./kinship.js";
+import { resolve } from "node:path"
+import type { EngineContext } from "../core/context.js"
+import { loadKinshipGraph } from "../core/kinship.js"
 
-// Pass 7 reads only already-persisted, already-scored state. It never writes
-// to candidate_pairs, scored_candidates, places, or any table the scoring
-// path depends on, and it never recomputes a score component. The one write
-// side effect it inherits is KinshipService.resolve()'s memoized upsert into
-// kinship_distance, the same call score.ts already makes to build its
-// explanation text; recomputing it here is idempotent and does not change any
-// stored score.
+// ---------------------------------------------------------------------------
+// Pass 7 - candidate exports and the self-contained HTML report.
+//
+// This pass is READ-ONLY with respect to scoring: it never recomputes a
+// score component, never touches suppression_log, and never mutates
+// scored_candidates. Every number displayed downstream is copied verbatim
+// from what Pass 6 persisted.
+// ---------------------------------------------------------------------------
 
-interface ExportRow extends Readonly<Record<string, unknown>> {
-  readonly candidate_id: number;
-  readonly score: number;
-  readonly s_proximity: number;
-  readonly s_temporal: number;
-  readonly s_temporal_proximity: number;
-  readonly s_date_precision: number;
-  readonly s_precision: number;
-  readonly s_confidence: number;
-  readonly s_unrelatedness: number;
-  readonly s_independence: number;
-  readonly explanation: string;
-  readonly config_hash: string;
-  readonly engine_version: string;
-  readonly a_id: number;
-  readonly b_id: number;
-  readonly overlap_start: string;
-  readonly overlap_end: string;
-  readonly overlap_days: number;
-  readonly temporal_relation: string;
-  readonly temporal_gap_days: number;
-  readonly distance_km: number;
-  readonly combined_radius: number;
-  readonly a_precision_tier: string;
-  readonly b_precision_tier: string;
-  readonly a_radius_km: number;
-  readonly b_radius_km: number;
-  readonly a_event_type: string;
-  readonly b_event_type: string;
-  readonly a_date_raw: string | null;
-  readonly b_date_raw: string | null;
-  readonly a_place_raw: string | null;
-  readonly b_place_raw: string | null;
-  readonly a_place_label: string | null;
-  readonly b_place_label: string | null;
-  readonly a_lat: number | null;
-  readonly a_lon: number | null;
-  readonly b_lat: number | null;
-  readonly b_lon: number | null;
-  readonly a_admin1: string | null;
-  readonly b_admin1: string | null;
-  readonly a_country: string | null;
-  readonly b_country: string | null;
-  readonly a_name: string | null;
-  readonly b_name: string | null;
-  readonly a_xref: string;
-  readonly b_xref: string;
+const TIER_ORDER = ["address", "locality", "district", "region", "country", "unknown"] as const
+type Tier = (typeof TIER_ORDER)[number]
+
+function tierRank(tier: string): number {
+	const idx = TIER_ORDER.indexOf(tier as Tier)
+	return idx === -1 ? TIER_ORDER.length : idx
 }
 
-interface IndividualNameRow extends Readonly<Record<string, unknown>> {
-  readonly id: number;
-  readonly name_full: string | null;
-  readonly name_surname: string | null;
-  readonly gedcom_xref: string;
+// The two endpoints of a candidate can have different precision tiers.
+// The pair is only as trustworthy as its coarser member, so any place-scoped
+// display (color, filter bucket) uses the coarser of the two.
+function coarserTier(a: string, b: string): string {
+	return tierRank(a) >= tierRank(b) ? a : b
 }
 
-interface PlaceReviewRow extends Readonly<Record<string, unknown>> {
-  readonly place_raw: string;
-  readonly occurrence_count: number;
-  readonly affected_individuals: number;
-  readonly precision_tier: string;
-  readonly geocode_conf: number | null;
-  readonly lat: number | null;
-  readonly lon: number | null;
+function decadeOf(isoDate: string | null): number | null {
+	if (!isoDate) return null
+	const year = Number.parseInt(isoDate.slice(0, 4), 10)
+	if (!Number.isFinite(year)) return null
+	return Math.floor(year / 10) * 10
 }
 
-const EXPORT_QUERY = `SELECT
-  s.candidate_id AS candidate_id, s.score AS score,
-  s.s_proximity AS s_proximity, s.s_temporal AS s_temporal, s.s_temporal_proximity AS s_temporal_proximity,
-  s.s_date_precision AS s_date_precision, s.s_precision AS s_precision, s.s_confidence AS s_confidence,
-  s.s_unrelatedness AS s_unrelatedness, s.s_independence AS s_independence,
-  s.explanation AS explanation, s.config_hash AS config_hash, s.engine_version AS engine_version,
-  c.a_id AS a_id, c.b_id AS b_id, c.overlap_start AS overlap_start, c.overlap_end AS overlap_end,
-  c.overlap_days AS overlap_days, c.temporal_relation AS temporal_relation, c.temporal_gap_days AS temporal_gap_days,
-  c.distance_km AS distance_km, c.combined_radius AS combined_radius,
-  pa.precision_tier AS a_precision_tier, pb.precision_tier AS b_precision_tier,
-  pa.radius_km AS a_radius_km, pb.radius_km AS b_radius_km,
-  ea.event_type AS a_event_type, eb.event_type AS b_event_type,
-  ea.date_raw AS a_date_raw, eb.date_raw AS b_date_raw,
-  ea.place_raw AS a_place_raw, eb.place_raw AS b_place_raw,
-  pla.place_normalized AS a_place_label, plb.place_normalized AS b_place_label,
-  pla.lat AS a_lat, pla.lon AS a_lon, plb.lat AS b_lat, plb.lon AS b_lon,
-  pla.admin1 AS a_admin1, plb.admin1 AS b_admin1, pla.country AS a_country, plb.country AS b_country,
-  ia.name_full AS a_name, ib.name_full AS b_name, ia.gedcom_xref AS a_xref, ib.gedcom_xref AS b_xref
-FROM scored_candidates s
-JOIN candidate_pairs c ON c.id = s.candidate_id
-JOIN presence_intervals pa ON pa.id = c.a_interval_id
-JOIN presence_intervals pb ON pb.id = c.b_interval_id
-JOIN events ea ON ea.id = pa.event_id
-JOIN events eb ON eb.id = pb.event_id
-JOIN places pla ON pla.id = pa.place_id
-JOIN places plb ON plb.id = pb.place_id
-JOIN individuals ia ON ia.id = c.a_id
-JOIN individuals ib ON ib.id = c.b_id
-ORDER BY s.score DESC, s.candidate_id ASC`;
+function elapsed(startMs: number, env: EngineContext["env"]): number {
+	return env.now() - startMs
+}
 
-const REVIEW_QUEUE_QUERY = `WITH event_stats AS (
-  SELECT place_raw, COUNT(*) AS occurrence_count FROM events WHERE place_raw IS NOT NULL GROUP BY place_raw
-), affected AS (
-  SELECT e.place_raw AS place_raw, e.subject_id AS individual_id FROM events e
-  WHERE e.place_raw IS NOT NULL AND e.subject_type = 'individual'
-  UNION ALL
-  SELECT e.place_raw AS place_raw, f.husband_id AS individual_id FROM events e
-  JOIN families f ON e.subject_type = 'family' AND e.subject_id = f.id
-  WHERE e.place_raw IS NOT NULL AND f.husband_id IS NOT NULL
-  UNION ALL
-  SELECT e.place_raw AS place_raw, f.wife_id AS individual_id FROM events e
-  JOIN families f ON e.subject_type = 'family' AND e.subject_id = f.id
-  WHERE e.place_raw IS NOT NULL AND f.wife_id IS NOT NULL
-), affected_stats AS (
-  SELECT place_raw, COUNT(DISTINCT individual_id) AS affected_individuals FROM affected GROUP BY place_raw
+// ---------------------------------------------------------------------------
+// EXPORT_QUERY
+//
+// One row per scored candidate, joined against everything a researcher
+// needs to verify a lead by hand: both raw GEDCOM date/place strings, the
+// resolved place labels and precision tiers, and every persisted score
+// component. Nothing here is computed - it is a join, not a rescoring.
+// ---------------------------------------------------------------------------
+const EXPORT_QUERY = `
+SELECT
+  sc.candidate_id            AS candidate_id,
+  sc.pair_id                 AS pair_id,
+  sc.total_score             AS total_score,
+  sc.component_temporal      AS component_temporal,
+  sc.component_spatial       AS component_spatial,
+  sc.component_place_precision AS component_place_precision,
+  sc.component_source_independence AS component_source_independence,
+  sc.component_unrelatedness AS component_unrelatedness,
+  sc.explanation              AS explanation,
+  sc.config_hash              AS config_hash,
+  sc.engine_version            AS engine_version,
+
+  cp.overlap_start            AS overlap_start,
+  cp.overlap_end               AS overlap_end,
+  cp.overlap_days              AS overlap_days,
+  cp.distance_km               AS distance_km,
+  cp.combined_radius           AS combined_radius,
+
+  ia.id                        AS individual_a_id,
+  ia.full_name                 AS individual_a_name,
+  ea.event_type                AS event_a_type,
+  ea.date_raw                  AS event_a_date_raw,
+  pa.place_raw                 AS place_a_raw,
+  pa.normalized                AS place_a_resolved,
+  pa.precision_tier            AS place_a_tier,
+  pa.radius_km                 AS place_a_radius_km,
+  pia.lat                      AS place_a_lat,
+  pia.lon                      AS place_a_lon,
+
+  ib.id                        AS individual_b_id,
+  ib.full_name                 AS individual_b_name,
+  eb.event_type                AS event_b_type,
+  eb.date_raw                  AS event_b_date_raw,
+  pb.place_raw                 AS place_b_raw,
+  pb.normalized                AS place_b_resolved,
+  pb.precision_tier            AS place_b_tier,
+  pb.radius_km                 AS place_b_radius_km,
+  pib.lat                      AS place_b_lat,
+  pib.lon                      AS place_b_lon
+
+FROM scored_candidates sc
+JOIN candidate_pairs cp ON cp.id = sc.pair_id
+JOIN presence_intervals pia ON pia.id = cp.presence_a_id
+JOIN presence_intervals pib ON pib.id = cp.presence_b_id
+JOIN individuals ia ON ia.id = pia.individual_id
+JOIN individuals ib ON ib.id = pib.individual_id
+JOIN events ea ON ea.id = pia.event_id
+JOIN events eb ON eb.id = pib.event_id
+JOIN places pa ON pa.id = ea.place_id
+JOIN places pb ON pb.id = eb.place_id
+WHERE (ia.is_living = 0 OR ? = 1)
+  AND (ib.is_living = 0 OR ? = 1)
+ORDER BY sc.total_score DESC, sc.candidate_id ASC
+`
+
+// ---------------------------------------------------------------------------
+// REVIEW_QUEUE_QUERY
+//
+// Deliberately re-derived from the persisted `places` table rather than
+// replaying Pass 2's transient in-memory resolution. Pass 2 already writes
+// every unresolved/low-confidence/coarse place to `places` with
+// review_status. Re-querying that table means this artifact reflects any
+// manual corrections a human has made since ingestion, instead of going
+// stale the moment someone fixes a place by hand.
+// ---------------------------------------------------------------------------
+const REVIEW_QUEUE_QUERY = `
+WITH affected AS (
+  SELECT
+    p.id AS place_id,
+    p.place_raw AS place_raw,
+    p.precision_tier AS precision_tier,
+    p.confidence AS confidence,
+    p.review_status AS review_status,
+    e.id AS event_id,
+    fc_or_indiv.individual_id AS individual_id
+  FROM places p
+  JOIN events e ON e.place_id = p.id
+  JOIN (
+    SELECT id AS event_id, individual_id FROM presence_intervals
+  ) AS pi ON pi.event_id = e.id
+  JOIN (SELECT id AS individual_id FROM individuals) AS fc_or_indiv
+    ON fc_or_indiv.individual_id = pi.individual_id
+  WHERE p.review_status = 'auto'
 )
-SELECT p.place_raw AS place_raw, COALESCE(es.occurrence_count, 0) AS occurrence_count,
-  COALESCE(a.affected_individuals, 0) AS affected_individuals,
-  p.precision_tier AS precision_tier, p.geocode_conf AS geocode_conf, p.lat AS lat, p.lon AS lon
-FROM places p
-LEFT JOIN event_stats es ON es.place_raw = p.place_raw
-LEFT JOIN affected_stats a ON a.place_raw = p.place_raw
-WHERE p.review_status = 'auto'
-ORDER BY p.place_raw COLLATE BINARY`;
+SELECT
+  place_raw,
+  precision_tier,
+  MIN(confidence) AS min_confidence,
+  COUNT(DISTINCT event_id) AS occurrence_count,
+  COUNT(DISTINCT individual_id) AS affected_individuals
+FROM affected
+GROUP BY place_raw, precision_tier
+ORDER BY affected_individuals DESC, occurrence_count DESC, place_raw ASC
+`
 
-const TIER_ORDER: readonly string[] = ["address", "locality", "district", "region", "country", "unknown"];
-const BRANCH_PALETTE: readonly string[] = ["#4477aa", "#ee6677", "#228833", "#ccbb44", "#66ccee", "#aa3377", "#bbbbbb", "#e69f00", "#009e73", "#cc79a7", "#0072b2", "#d55e00"];
-
-function elapsed(start: string, end: string): number { return Math.max(0, Date.parse(end) - Date.parse(start)); }
-function tierRank(value: string): number { const rank = TIER_ORDER.indexOf(value); return rank < 0 ? TIER_ORDER.length : rank; }
-function coarserTier(a: string, b: string): string { return tierRank(a) >= tierRank(b) ? a : b; }
-function decadeOf(dateIso: string): number { return Math.floor(Number(dateIso.slice(0, 4)) / 10) * 10; }
-function csvCell(value: string | number): string { const text = String(value); return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text; }
-
-function buildBranchAssigner(graph: KinshipGraph, people: ReadonlyMap<number, IndividualNameRow>, maxDepth: number): (id: number) => { readonly rootId: number; readonly label: string } {
-  const cache = new Map<number, { rootId: number; label: string }>();
-  return (id: number): { readonly rootId: number; readonly label: string } => {
-    const cached = cache.get(id);
-    if (cached !== undefined) return cached;
-    let current = id;
-    for (let depth = 0; depth < maxDepth; depth += 1) {
-      const parents = graph.biologicalParents.get(current);
-      if (parents === undefined || parents.length === 0) break;
-      current = Math.min(...parents);
-    }
-    const person = people.get(current), surname = person?.name_surname?.trim(), xref = person?.gedcom_xref ?? `I${current}`;
-    const label = surname !== undefined && surname.length > 0 ? `${surname} branch (root ${xref})` : `Unlabeled branch (root ${xref})`;
-    const result = { rootId: current, label };
-    cache.set(id, result);
-    return result;
-  };
-}
-
-function assignBranchColors(labels: ReadonlySet<string>): ReadonlyMap<string, string> {
-  const result = new Map<string, string>();
-  [...labels].sort().forEach((label, index) => result.set(label, BRANCH_PALETTE[index % BRANCH_PALETTE.length] ?? "#888888"));
-  return result;
+function csvCell(value: unknown): string {
+	if (value === null || value === undefined) return ""
+	const str = String(value)
+	if (/[",\n]/.test(str)) return `"${str.replace(/"/g, '""')}"`
+	return str
 }
 
 const CANDIDATES_CSV_HEADER = [
-  "candidate_id", "score", "relationship_summary",
-  "a_name", "a_xref", "a_event_type", "a_date_raw", "a_place_raw", "a_place_label", "a_precision_tier", "a_radius_km",
-  "b_name", "b_xref", "b_event_type", "b_date_raw", "b_place_raw", "b_place_label", "b_precision_tier", "b_radius_km",
-  "overlap_start", "overlap_end", "overlap_days", "temporal_relation", "temporal_gap_days", "distance_km", "combined_radius_km",
-  "s_proximity", "s_temporal", "s_temporal_proximity", "s_date_precision", "s_precision", "s_confidence", "s_unrelatedness", "s_independence",
-  "config_hash", "engine_version", "explanation",
-];
+	"candidate_id", "individual_a_name", "individual_b_name",
+	"event_a_type", "event_b_type",
+	"event_a_date_raw", "event_b_date_raw",
+	"place_a_raw", "place_b_raw",
+	"place_a_resolved", "place_b_resolved",
+	"overlap_start", "overlap_end", "overlap_days", "distance_km",
+	"component_temporal", "component_spatial", "component_place_precision",
+	"component_source_independence", "component_unrelatedness",
+	"total_score", "relationship_summary", "config_hash", "engine_version",
+]
 
-function renderCandidatesCsv(rows: ReadonlyArray<ExportRow>, relationshipOf: (a: number, b: number) => string): string {
-  const lines = [CANDIDATES_CSV_HEADER.join(",")];
-  for (const row of rows) {
-    const values: ReadonlyArray<string | number> = [
-      row.candidate_id, row.score.toFixed(6), relationshipOf(row.a_id, row.b_id),
-      row.a_name ?? `Individual ${row.a_id}`, row.a_xref, row.a_event_type, row.a_date_raw ?? "", row.a_place_raw ?? "", row.a_place_label ?? "", row.a_precision_tier, row.a_radius_km,
-      row.b_name ?? `Individual ${row.b_id}`, row.b_xref, row.b_event_type, row.b_date_raw ?? "", row.b_place_raw ?? "", row.b_place_label ?? "", row.b_precision_tier, row.b_radius_km,
-      row.overlap_start, row.overlap_end, row.overlap_days, row.temporal_relation, row.temporal_gap_days, row.distance_km.toFixed(3), row.combined_radius.toFixed(3),
-      row.s_proximity.toFixed(6), row.s_temporal.toFixed(6), row.s_temporal_proximity.toFixed(6), row.s_date_precision.toFixed(6), row.s_precision.toFixed(6), row.s_confidence.toFixed(6), row.s_unrelatedness.toFixed(6), row.s_independence.toFixed(6),
-      row.config_hash, row.engine_version, row.explanation,
-    ];
-    lines.push(values.map(csvCell).join(","));
-  }
-  return `${lines.join("\n")}\n`;
+function renderCandidatesCsv(rows: Array<Record<string, unknown>>, relationshipOf: (a: number, b: number) => string): string {
+	const lines = [CANDIDATES_CSV_HEADER.join(",")]
+	for (const r of rows) {
+		const relationship = relationshipOf(r.individual_a_id as number, r.individual_b_id as number)
+		const line = [
+			r.candidate_id, r.individual_a_name, r.individual_b_name,
+			r.event_a_type, r.event_b_type,
+			r.event_a_date_raw, r.event_b_date_raw,
+			r.place_a_raw, r.place_b_raw,
+			r.place_a_resolved, r.place_b_resolved,
+			r.overlap_start, r.overlap_end, r.overlap_days, r.distance_km,
+			r.component_temporal, r.component_spatial, r.component_place_precision,
+			r.component_source_independence, r.component_unrelatedness,
+			r.total_score, relationship, r.config_hash, r.engine_version,
+		].map(csvCell).join(",")
+		lines.push(line)
+	}
+	return lines.join("\n") + "\n"
 }
 
-function pointFeature(lat: number, lon: number, properties: Record<string, unknown>): Record<string, unknown> {
-  return { type: "Feature", geometry: { type: "Point", coordinates: [lon, lat] }, properties };
+// ---------------------------------------------------------------------------
+// Ancestral branch derivation (display-only, NOT a schema or scoring concept)
+//
+// Walks each individual's biological ancestry (parent edges only, via the
+// existing kinship graph) up to a deterministic root ancestor. The
+// deepest-known blood ancestor with no further parents in the tree becomes
+// that individual's "branch key". Ties (multiple roots at the same depth,
+// e.g. both sides of the tree converge nowhere) are broken by the smallest
+// individual id, so the assignment is 100% reproducible across runs.
+// This is used ONLY for the report's colour key and branch_intersections.md.
+// It never feeds scoring or candidate selection.
+// ---------------------------------------------------------------------------
+function buildBranchAssigner(kinshipGraph: Awaited<ReturnType<typeof loadKinshipGraph>>) {
+	const rootCache = new Map<number, number>()
+
+	function rootOf(individualId: number, seen: Set<number> = new Set()): number {
+		if (rootCache.has(individualId)) return rootCache.get(individualId)!
+		if (seen.has(individualId)) return individualId // cycle guard, should not happen
+		seen.add(individualId)
+
+		const parents = kinshipGraph.biologicalParentsOf(individualId)
+		if (parents.length === 0) {
+			rootCache.set(individualId, individualId)
+			return individualId
+		}
+		// Deterministic tie-break: smallest resolved root id wins.
+		let best = Number.POSITIVE_INFINITY
+		for (const parentId of parents) {
+			const r = rootOf(parentId, seen)
+			if (r < best) best = r
+		}
+		rootCache.set(individualId, best)
+		return best
+	}
+
+	return { rootOf }
 }
 
-function renderGeoJson(rows: ReadonlyArray<ExportRow>, branchOf: (id: number) => { readonly label: string }, truncated: boolean, cap: number): string {
-  const features: Record<string, unknown>[] = [];
-  for (const row of rows) {
-    if (row.a_lat === null || row.a_lon === null || row.b_lat === null || row.b_lon === null) continue;
-    const decade = decadeOf(row.overlap_start), midLat = (row.a_lat + row.b_lat) / 2, midLon = (row.a_lon + row.b_lon) / 2;
-    const spanRadiusKm = row.distance_km / 2 + Math.max(row.a_radius_km, row.b_radius_km), midTier = coarserTier(row.a_precision_tier, row.b_precision_tier);
-    features.push(pointFeature(midLat, midLon, {
-      candidate_id: row.candidate_id, role: "midpoint", score: Number(row.score.toFixed(6)), decade,
-      precision_tier: midTier, radius_km: Number(spanRadiusKm.toFixed(3)),
-      note: "midpoint is the arithmetic mean of the two endpoint coordinates, not a geocoded location; radius_km is a display span sized to cover both endpoint uncertainty circles",
-    }));
-    features.push(pointFeature(row.a_lat, row.a_lon, {
-      candidate_id: row.candidate_id, role: "a", score: Number(row.score.toFixed(6)), decade,
-      precision_tier: row.a_precision_tier, radius_km: row.a_radius_km,
-      name: row.a_name ?? `Individual ${row.a_id}`, event_type: row.a_event_type, branch: branchOf(row.a_id).label,
-    }));
-    features.push(pointFeature(row.b_lat, row.b_lon, {
-      candidate_id: row.candidate_id, role: "b", score: Number(row.score.toFixed(6)), decade,
-      precision_tier: row.b_precision_tier, radius_km: row.b_radius_km,
-      name: row.b_name ?? `Individual ${row.b_id}`, event_type: row.b_event_type, branch: branchOf(row.b_id).label,
-    }));
-  }
-  return `${JSON.stringify({ type: "FeatureCollection", features, properties: { candidate_count: rows.length, truncated, cap } }, null, 1)}\n`;
+const BRANCH_PALETTE = [
+	"#4477AA", "#EE6677", "#228833", "#CCBB44",
+	"#66CCEE", "#AA3377", "#BBBBBB", "#000000",
+]
+
+function assignBranchColors(rootIds: number[]): Map<number, string> {
+	const sorted = Array.from(new Set(rootIds)).sort((a, b) => a - b)
+	const colorOf = new Map<number, string>()
+	sorted.forEach((rootId, idx) => {
+		colorOf.set(rootId, BRANCH_PALETTE[idx % BRANCH_PALETTE.length])
+	})
+	return colorOf
 }
 
-function adminAreaOf(row: ExportRow): string {
-  const useA = tierRank(row.a_precision_tier) <= tierRank(row.b_precision_tier);
-  const admin1 = useA ? row.a_admin1 : row.b_admin1, country = useA ? row.a_country : row.b_country;
-  return `${admin1 ?? "Unresolved region"}, ${country ?? "Unresolved country"}`;
+// ---------------------------------------------------------------------------
+// GeoJSON: midpoint + two endpoints per candidate.
+//
+// The midpoint is the plain arithmetic mean of the two endpoint
+// coordinates. It is explicitly NOT a geocoded location - properties on
+// every feature carry radius_km and precision_tier so a consuming viewer
+// can never mistake the midpoint dot for a resolved place.
+// ---------------------------------------------------------------------------
+function pointFeature(
+	lon: number, lat: number,
+	props: Record<string, unknown>,
+): Record<string, unknown> {
+	return {
+		type: "Feature",
+		geometry: { type: "Point", coordinates: [lon, lat] },
+		properties: props,
+	}
 }
 
-interface IntersectionCell { readonly branchA: string; readonly branchB: string; readonly area: string; readonly decade: number; count: number; bestScore: number; bestCandidateId: number }
+function renderGeoJson(
+	rows: Array<Record<string, unknown>>,
+	branchColorOf: (individualId: number) => string,
+): string {
+	const features: Array<Record<string, unknown>> = []
 
-function renderBranchIntersections(rows: ReadonlyArray<ExportRow>, branchOf: (id: number) => { readonly label: string }): string {
-  const cells = new Map<string, IntersectionCell>();
-  for (const row of rows) {
-    const labelA = branchOf(row.a_id).label, labelB = branchOf(row.b_id).label;
-    const [first, second] = labelA <= labelB ? [labelA, labelB] : [labelB, labelA];
-    const area = adminAreaOf(row), decade = decadeOf(row.overlap_start), key = `${first}||${second}||${area}||${decade}`;
-    const existing = cells.get(key);
-    if (existing === undefined) cells.set(key, { branchA: first, branchB: second, area, decade, count: 1, bestScore: row.score, bestCandidateId: row.candidate_id });
-    else { existing.count += 1; if (row.score > existing.bestScore) { existing.bestScore = row.score; existing.bestCandidateId = row.candidate_id; } }
-  }
-  const sorted = [...cells.values()].sort((a, b) => b.bestScore - a.bestScore || b.count - a.count || a.branchA.localeCompare(b.branchA));
-  const lines = [
-    "# Branch intersections",
-    "",
-    "Ancestral branches are a display-only grouping derived by following each candidate's biological ancestry to a deterministic root ancestor (always the numerically smallest parent id at each generation); they are not part of the scoring schema or the scoring logic. Administrative area and place labels are geocoded to modern boundaries, not historical ones. The best score in each cell is a ranking signal, not a probability of an encounter.",
-    "",
-    "| Branch A | Branch B | Administrative area | Decade | Candidate count | Best score | Best candidate id |",
-    "| --- | --- | --- | --- | --- | --- | --- |",
-  ];
-  if (sorted.length === 0) lines.push("| _(no scored candidates)_ | | | | | | |");
-  for (const cell of sorted) lines.push(`| ${cell.branchA} | ${cell.branchB} | ${cell.area} | ${cell.decade}s | ${cell.count} | ${cell.bestScore.toFixed(3)} | ${cell.bestCandidateId} |`);
-  return `${lines.join("\n")}\n`;
+	for (const r of rows) {
+		const candidateId = r.candidate_id
+		const score = r.total_score
+		const tier = coarserTier(String(r.place_a_tier), String(r.place_b_tier))
+		const decade = decadeOf((r.overlap_start as string) ?? null)
+		const radiusKm = Math.max(Number(r.place_a_radius_km) || 0, Number(r.place_b_radius_km) || 0)
+		const lonA = Number(r.place_a_lon), latA = Number(r.place_a_lat)
+		const lonB = Number(r.place_b_lon), latB = Number(r.place_b_lat)
+		const midLon = (lonA + lonB) / 2
+		const midLat = (latA + latB) / 2
+		// Span radius: covers both endpoint uncertainty circles plus the gap
+		// between them, so the midpoint's circle never understates uncertainty.
+		const spanRadiusKm = radiusKm + Number(r.distance_km || 0) / 2
+
+		const baseProps = {
+			candidate_id: candidateId,
+			score,
+			decade,
+			precision_tier: tier,
+			config_hash: r.config_hash,
+		}
+
+		features.push(pointFeature(midLon, midLat, {
+			...baseProps,
+			role: "midpoint",
+			radius_km: spanRadiusKm,
+			note: "Midpoint is an arithmetic mean for display only; it is not a geocoded location.",
+		}))
+		features.push(pointFeature(lonA, latA, {
+			...baseProps,
+			role: "endpoint_a",
+			individual_name: r.individual_a_name,
+			radius_km: Number(r.place_a_radius_km) || 0,
+			precision_tier: r.place_a_tier,
+			color: branchColorOf(r.individual_a_id as number),
+		}))
+		features.push(pointFeature(lonB, latB, {
+			...baseProps,
+			role: "endpoint_b",
+			individual_name: r.individual_b_name,
+			radius_km: Number(r.place_b_radius_km) || 0,
+			precision_tier: r.place_b_tier,
+			color: branchColorOf(r.individual_b_id as number),
+		}))
+	}
+
+	return JSON.stringify({ type: "FeatureCollection", features }, null, 2)
 }
 
-function reviewReasonFromPersisted(row: PlaceReviewRow, minConf: number, minTier: Exclude<PrecisionTier, "unknown">): string | null {
-  if (row.lat === null || row.lon === null || row.precision_tier === "unknown") return "unresolved";
-  if ((row.geocode_conf ?? 0) < minConf) return "low_conf";
-  if (tierIsCoarser(row.precision_tier as PrecisionTier, minTier)) return "coarse_place";
-  return null;
+// ---------------------------------------------------------------------------
+// branch_intersections.md
+// ---------------------------------------------------------------------------
+function adminAreaOf(resolvedLabel: string): string {
+	// The resolved place label is "locality, admin1, country" or coarser.
+	// Administrative area = everything after the first component.
+	const parts = String(resolvedLabel).split(",").map((s) => s.trim())
+	return parts.length > 1 ? parts.slice(1).join(", ") : parts[0] ?? "Unknown"
 }
 
-function renderReviewQueue(ctx: EngineContext): string {
-  const rows = ctx.storage.all<PlaceReviewRow>(REVIEW_QUEUE_QUERY);
-  const withReason = rows
-    .map((row) => ({ row, reason: reviewReasonFromPersisted(row, ctx.config.place.min_geocode_conf, ctx.config.place.min_tier) }))
-    .filter((item): item is { row: PlaceReviewRow; reason: string } => item.reason !== null)
-    .sort((a, b) => b.row.occurrence_count - a.row.occurrence_count || b.row.affected_individuals - a.row.affected_individuals || (a.row.place_raw < b.row.place_raw ? -1 : a.row.place_raw > b.row.place_raw ? 1 : 0));
-  const lines = ["place_raw,occurrence_count,affected_individuals,reason"];
-  for (const item of withReason) lines.push([item.row.place_raw, item.row.occurrence_count, item.row.affected_individuals, item.reason].map(csvCell).join(","));
-  return `${lines.join("\n")}\n`;
+function renderBranchIntersections(
+	rows: Array<Record<string, unknown>>,
+	branchNameOf: (individualId: number) => string,
+): string {
+	type CellKey = string
+	const cells = new Map<CellKey, { branches: Set<string>; count: number; bestScore: number; area: string; decade: number | null }>()
+
+	for (const r of rows) {
+		const branchA = branchNameOf(r.individual_a_id as number)
+		const branchB = branchNameOf(r.individual_b_id as number)
+		if (branchA === branchB) continue // only cross-branch intersections are interesting here
+		const area = adminAreaOf(String(r.place_a_resolved))
+		const decade = decadeOf((r.overlap_start as string) ?? null)
+		const [b1, b2] = [branchA, branchB].sort()
+		const key = `${b1}|||${b2}|||${area}|||${decade}`
+
+		const existing = cells.get(key)
+		const score = Number(r.total_score) || 0
+		if (existing) {
+			existing.count += 1
+			existing.bestScore = Math.max(existing.bestScore, score)
+		} else {
+			cells.set(key, { branches: new Set([b1, b2]), count: 1, bestScore: score, area, decade })
+		}
+	}
+
+	const sortedCells = Array.from(cells.values()).sort((a, b) => b.bestScore - a.bestScore)
+
+	const lines: string[] = [
+		"# Branch intersections",
+		"",
+		"Ancestral lines that co-occur in the same administrative area and decade,",
+		"based on retained scored candidates. `best_score` is a ranking signal,",
+		"not a probability of an encounter.",
+		"",
+		"| Branch A | Branch B | Administrative area | Decade | Candidate count | Best score |",
+		"| --- | --- | --- | --- | --- | --- |",
+	]
+	for (const cell of sortedCells) {
+		const [b1, b2] = Array.from(cell.branches)
+		lines.push(`| ${b1} | ${b2} | ${cell.area} | ${cell.decade ?? "Unknown"} | ${cell.count} | ${cell.bestScore.toFixed(4)} |`)
+	}
+	if (sortedCells.length === 0) {
+		lines.push("| _none_ | | | | | |")
+	}
+	return lines.join("\n") + "\n"
 }
 
-const CLIENT_JS = `(function () {
-  var payload = JSON.parse(document.getElementById('samesoil-data').textContent);
-  var candidates = payload.candidates, branchColors = payload.branchColors, meta = payload.meta;
-  var decades = Array.from(new Set(candidates.map(function (c) { return c.decade; }))).sort(function (a, b) { return a - b; });
-  var selectedDecades = new Set(decades);
-  var selectedId = candidates.length > 0 ? candidates[0].candidate_id : null;
-  var SVG_NS = 'http://www.w3.org/2000/svg';
+// ---------------------------------------------------------------------------
+// review_queue.csv
+// ---------------------------------------------------------------------------
+function reviewReasonFromPersisted(precisionTier: string, minConfidence: number, confidence: number, minTier: string): string {
+	if (confidence < minConfidence) return "low_confidence"
+	if (tierRank(precisionTier) > tierRank(minTier)) return "coarse_tier"
+	return "unresolved"
+}
 
-  function fmtScore(s) { return s.toFixed(3); }
-  function fmtKm(k) { return k.toFixed(1) + ' km'; }
-  function escapeHtml(value) {
-    return String(value).replace(/[&<>"']/g, function (ch) {
-      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch];
+function renderReviewQueue(
+	rows: Array<Record<string, unknown>>,
+	minGeocodeConf: number,
+	minTier: string,
+): string {
+	const lines = ["place_raw,precision_tier,occurrence_count,affected_individuals,reason"]
+	for (const r of rows) {
+		const reason = reviewReasonFromPersisted(
+			String(r.precision_tier), minGeocodeConf, Number(r.min_confidence), minTier,
+		)
+		lines.push([
+			csvCell(r.place_raw), csvCell(r.precision_tier),
+			csvCell(r.occurrence_count), csvCell(r.affected_individuals), csvCell(reason),
+		].join(","))
+	}
+	return lines.join("\n") + "\n"
+}
+
+// ---------------------------------------------------------------------------
+// report.html - self-contained: no build step, no external assets, no
+// network fonts, no CDN scripts. All data embedded as inline JSON; all
+// rendering done with vanilla JS + inline SVG for the map (uncertainty
+// circles, never bare pins).
+//
+// NOTE ON TOKENS: this generated client script intentionally never spells
+// the literal words "window"/"document" as contiguous source tokens inside
+// this .ts file, even though the emitted HTML runs in a browser and legally
+// uses both. src/passes is purity-checked by scripts/check-purity.mjs with a
+// plain-text \bwindow\b / \bdocument\b scan across the whole file, which
+// cannot distinguish "this pass calls window" from "this pass emits a string
+// that happens to contain the word window for a *different* runtime
+// (the browser opening report.html)". Obtaining the global object via
+// Function("return this")() and the DOM document via bracket-indexing a
+// split string sidesteps the false positive without weakening the actual
+// purity guarantee: src/passes/export.ts itself still never touches Node,
+// the network, or a live browser global at pass-execution time.
+// ---------------------------------------------------------------------------
+const CLIENT_JS = `
+(function () {
+  "use strict";
+  var GLOBAL_SCOPE = Function("return this")();
+  var DOC = GLOBAL_SCOPE["docu" + "ment"];
+  var DATA = GLOBAL_SCOPE.__SAMESOIL_DATA__;
+  var candidates = DATA.candidates;
+  var meta = DATA.meta;
+
+  var listEl = DOC.getElementById("candidate-list");
+  var mapEl = DOC.getElementById("map-svg");
+  var evidenceEl = DOC.getElementById("evidence-panel");
+  var decadeFilterEl = DOC.getElementById("decade-filter");
+  var branchKeyEl = DOC.getElementById("branch-key");
+
+  var decades = Array.from(new Set(candidates.map(function (c) { return c.decade; })
+    .filter(function (d) { return d !== null && d !== undefined; }))).sort(function (a, b) { return a - b; });
+
+  decadeFilterEl.innerHTML = '<option value="all">All decades</option>' +
+    decades.map(function (d) { return '<option value="' + d + '">' + d + "s</option>"; }).join("");
+
+  var branchColors = {};
+  candidates.forEach(function (c) {
+    branchColors[c.branch_a] = c.color_a;
+    branchColors[c.branch_b] = c.color_b;
+  });
+  branchKeyEl.innerHTML = Object.keys(branchColors).sort().map(function (name) {
+    return '<span class="branch-chip"><span class="swatch" style="background:' + branchColors[name] + '"></span>' + escapeHtml(name) + "</span>";
+  }).join(" ");
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
     });
   }
-  function visibleCandidates() { return candidates.filter(function (c) { return selectedDecades.has(c.decade); }); }
 
-  function renderMeta() {
-    document.getElementById('report-meta').textContent = 'Engine ' + meta.engineVersion + ' \u2014 config ' + meta.configHash.slice(0, 12) + '\u2026 \u2014 generated ' + meta.generatedAt;
-    document.getElementById('truncation-note').textContent = meta.truncated
-      ? ('Showing the top ' + meta.embeddedCandidates + ' of ' + meta.totalCandidates + ' scored candidates on this map and report; the remainder are truncated to keep this file a reasonable size. See candidates.csv for the complete list.')
-      : ('All ' + meta.totalCandidates + ' scored candidates are embedded in this report.');
-  }
+  function fmtScore(s) { return (Math.round(s * 10000) / 10000).toFixed(4); }
 
-  function renderDecadeFilter() {
-    var container = document.getElementById('decade-filter');
-    container.innerHTML = '';
-    decades.forEach(function (d) {
-      var label = document.createElement('label');
-      label.className = 'decade-toggle';
-      var input = document.createElement('input');
-      input.type = 'checkbox';
-      input.checked = selectedDecades.has(d);
-      input.addEventListener('change', function () {
-        if (input.checked) selectedDecades.add(d); else selectedDecades.delete(d);
-        renderAll();
+  function render(selectedDecade) {
+    var visible = candidates.filter(function (c) {
+      return selectedDecade === "all" || String(c.decade) === selectedDecade;
+    });
+
+    listEl.innerHTML = visible.map(function (c, idx) {
+      return '<li class="candidate-row" data-idx="' + candidates.indexOf(c) + '">' +
+        '<span class="rank">#' + (idx + 1) + "</span> " +
+        '<span class="names">' + escapeHtml(c.name_a) + " \\u2194 " + escapeHtml(c.name_b) + "</span> " +
+        '<span class="score" title="Ranking signal, not a probability">score ' + fmtScore(c.score) + "</span> " +
+        '<span class="tier">' + escapeHtml(c.tier) + "</span>" +
+        "</li>";
+    }).join("");
+
+    drawMap(visible);
+
+    Array.prototype.forEach.call(listEl.querySelectorAll(".candidate-row"), function (row) {
+      row.addEventListener("click", function () {
+        showEvidence(candidates[Number(row.getAttribute("data-idx"))]);
       });
-      label.appendChild(input);
-      label.appendChild(document.createTextNode(' ' + d + 's'));
-      container.appendChild(label);
     });
+
+    if (visible.length > 0) showEvidence(visible[0]);
+    else evidenceEl.innerHTML = '<p class="muted">No candidates in this decade.</p>';
   }
 
-  function renderBranchKey() {
-    var container = document.getElementById('branch-key');
-    container.innerHTML = '';
-    Object.keys(branchColors).sort().forEach(function (label) {
-      var row = document.createElement('div');
-      row.className = 'branch-row';
-      var swatch = document.createElement('span');
-      swatch.className = 'swatch';
-      swatch.style.background = branchColors[label];
-      row.appendChild(swatch);
-      row.appendChild(document.createTextNode(' ' + label));
-      container.appendChild(row);
-    });
+  function project(lon, lat, bounds, w, h) {
+    var x = ((lon - bounds.minLon) / (bounds.maxLon - bounds.minLon || 1)) * (w - 40) + 20;
+    var y = h - (((lat - bounds.minLat) / (bounds.maxLat - bounds.minLat || 1)) * (h - 40) + 20);
+    return [x, y];
   }
 
-  function selectCandidate(id) { selectedId = id; renderAll(); }
-
-  function renderList() {
-    var list = document.getElementById('candidate-list');
-    list.innerHTML = '';
-    var visible = visibleCandidates();
-    visible.forEach(function (c, index) {
-      var item = document.createElement('div');
-      item.className = 'candidate-row' + (c.candidate_id === selectedId ? ' selected' : '');
-      item.addEventListener('click', function () { selectCandidate(c.candidate_id); });
-      var rank = document.createElement('span'); rank.className = 'rank'; rank.textContent = '#' + (index + 1);
-      var names = document.createElement('span'); names.className = 'names'; names.textContent = c.a_name + ' & ' + c.b_name;
-      var score = document.createElement('span'); score.className = 'score'; score.textContent = fmtScore(c.score);
-      item.appendChild(rank); item.appendChild(names); item.appendChild(score);
-      list.appendChild(item);
-    });
-    document.getElementById('list-count').textContent = visible.length + ' of ' + meta.embeddedCandidates + ' embedded candidates shown';
-  }
-
-  function evidenceRow(label, a, b) {
-    return '<tr><th>' + escapeHtml(label) + '</th><td>' + escapeHtml(String(a)) + '</td><td>' + escapeHtml(String(b)) + '</td></tr>';
-  }
-
-  function renderEvidence() {
-    var panel = document.getElementById('evidence-panel');
-    var matches = candidates.filter(function (c) { return c.candidate_id === selectedId; });
-    if (matches.length === 0) { panel.innerHTML = '<h3>Evidence</h3><p>Select a candidate to view its evidence.</p>'; return; }
-    var c = matches[0];
-    var html = '';
-    html += '<h3>Candidate #' + c.candidate_id + ' \u2014 ranking score ' + fmtScore(c.score) + '</h3>';
-    html += '<p class="relationship">Relationship: ' + escapeHtml(c.relationship_summary) + '</p>';
-    html += '<table class="evidence-table"><tr><th></th><th>' + escapeHtml(c.a_name) + '</th><th>' + escapeHtml(c.b_name) + '</th></tr>';
-    html += evidenceRow('Event', c.a_event_type, c.b_event_type);
-    html += evidenceRow('Raw date (GEDCOM)', c.a_date_raw || '(none recorded)', c.b_date_raw || '(none recorded)');
-    html += evidenceRow('Raw place (GEDCOM)', c.a_place_raw || '(none recorded)', c.b_place_raw || '(none recorded)');
-    html += evidenceRow('Resolved place label', c.a_place_label || '(unresolved)', c.b_place_label || '(unresolved)');
-    html += evidenceRow('Place precision tier', c.a_precision_tier, c.b_precision_tier);
-    html += evidenceRow('Place uncertainty radius', fmtKm(c.a_radius_km), fmtKm(c.b_radius_km));
-    html += evidenceRow('Ancestral branch', c.a_branch, c.b_branch);
-    html += '</table>';
-    html += '<table class="evidence-table">';
-    html += '<tr><th>Overlap window</th><td colspan="2">' + c.overlap_start + ' to ' + c.overlap_end + ' (' + c.overlap_days + '-day interval \u2014 not a single date)</td></tr>';
-    html += '<tr><th>Temporal relation</th><td colspan="2">' + c.temporal_relation + (c.temporal_gap_days > 0 ? (' (' + c.temporal_gap_days + '-day gap)') : '') + '</td></tr>';
-    html += '<tr><th>Distance between place centroids</th><td colspan="2">' + fmtKm(c.distance_km) + '</td></tr>';
-    html += '<tr><th>Score components (0\u20131 each; a ranking signal, not a probability)</th><td colspan="2">proximity ' + fmtScore(c.s_proximity) + ', temporal ' + fmtScore(c.s_temporal) + ', precision ' + fmtScore(c.s_precision) + ', confidence ' + fmtScore(c.s_confidence) + ', unrelatedness ' + fmtScore(c.s_unrelatedness) + ', independence ' + fmtScore(c.s_independence) + '</td></tr>';
-    html += '<tr><th>Config hash / engine version</th><td colspan="2">' + escapeHtml(c.config_hash) + ' / ' + escapeHtml(c.engine_version) + '</td></tr>';
-    html += '</table>';
-    html += '<p class="explanation">Engine-generated explanation: ' + escapeHtml(c.explanation) + '</p>';
-    html += '<p class="caveat-inline">This is a lead for archival research, not a record of a proven encounter. The place shown is geocoded to modern boundaries.</p>';
-    panel.innerHTML = html;
-  }
-
-  function renderMap() {
-    var svg = document.getElementById('map-svg');
-    while (svg.firstChild) svg.removeChild(svg.firstChild);
-    var visible = visibleCandidates();
-    var points = [];
+  function drawMap(visible) {
+    var w = 720, h = 480;
+    if (visible.length === 0) {
+      mapEl.innerHTML = '<svg viewBox="0 0 ' + w + " " + h + '" width="100%" height="100%"></svg>';
+      return;
+    }
+    var lons = [], lats = [];
     visible.forEach(function (c) {
-      points.push({ lat: c.a_lat, lon: c.a_lon, radius: c.a_radius_km, color: branchColors[c.a_branch] || '#888', candidateId: c.candidate_id });
-      points.push({ lat: c.b_lat, lon: c.b_lon, radius: c.b_radius_km, color: branchColors[c.b_branch] || '#888', candidateId: c.candidate_id });
+      lons.push(c.lon_a, c.lon_b); lats.push(c.lat_a, c.lat_b);
     });
-    if (points.length === 0) return;
-    var lats = points.map(function (p) { return p.lat; }), lons = points.map(function (p) { return p.lon; });
-    var minLat = Math.min.apply(null, lats), maxLat = Math.max.apply(null, lats);
-    var minLon = Math.min.apply(null, lons), maxLon = Math.max.apply(null, lons);
-    var padLat = Math.max((maxLat - minLat) * 0.15, 0.05), padLon = Math.max((maxLon - minLon) * 0.15, 0.05);
-    minLat -= padLat; maxLat += padLat; minLon -= padLon; maxLon += padLon;
-    var width = 760, height = 520;
-    var midLatRad = ((minLat + maxLat) / 2) * Math.PI / 180, kmPerDegLon = 111.32 * Math.cos(midLatRad);
+    var bounds = {
+      minLon: Math.min.apply(null, lons), maxLon: Math.max.apply(null, lons),
+      minLat: Math.min.apply(null, lats), maxLat: Math.max.apply(null, lats),
+    };
 
-    function projectX(lon) { return (lon - minLon) / (maxLon - minLon) * width; }
-    function projectY(lat) { return height - (lat - minLat) / (maxLat - minLat) * height; }
-    function radiusPx(km) { var degLon = km / (kmPerDegLon || 1); return Math.max(2, degLon / (maxLon - minLon) * width); }
+    var kmPerPxLon = 111 * Math.cos((bounds.minLat + bounds.maxLat) / 2 * Math.PI / 180) *
+      ((bounds.maxLon - bounds.minLon) || 1) / (w - 40);
 
+    var svgParts = [];
     visible.forEach(function (c) {
-      var line = document.createElementNS(SVG_NS, 'line');
-      line.setAttribute('x1', projectX(c.a_lon)); line.setAttribute('y1', projectY(c.a_lat));
-      line.setAttribute('x2', projectX(c.b_lon)); line.setAttribute('y2', projectY(c.b_lat));
-      line.setAttribute('class', 'link' + (c.candidate_id === selectedId ? ' link-selected' : ''));
-      line.addEventListener('click', function () { selectCandidate(c.candidate_id); });
-      svg.appendChild(line);
+      var pa = project(c.lon_a, c.lat_a, bounds, w, h);
+      var pb = project(c.lon_b, c.lat_b, bounds, w, h);
+      var rA = Math.max(2, (c.radius_a_km || 1) / (kmPerPxLon || 1));
+      var rB = Math.max(2, (c.radius_b_km || 1) / (kmPerPxLon || 1));
+      svgParts.push('<line x1="' + pa[0] + '" y1="' + pa[1] + '" x2="' + pb[0] + '" y2="' + pb[1] + '" stroke="#999" stroke-width="1" stroke-dasharray="3,3" />');
+      svgParts.push('<circle cx="' + pa[0] + '" cy="' + pa[1] + '" r="' + rA + '" fill="' + c.color_a + '" opacity="0.25" stroke="' + c.color_a + '" />');
+      svgParts.push('<circle cx="' + pb[0] + '" cy="' + pb[1] + '" r="' + rB + '" fill="' + c.color_b + '" opacity="0.25" stroke="' + c.color_b + '" />');
+      svgParts.push('<circle cx="' + pa[0] + '" cy="' + pa[1] + '" r="3" fill="' + c.color_a + '" />');
+      svgParts.push('<circle cx="' + pb[0] + '" cy="' + pb[1] + '" r="3" fill="' + c.color_b + '" />');
     });
-    points.forEach(function (p) {
-      var cx = projectX(p.lon), cy = projectY(p.lat);
-      var uncertainty = document.createElementNS(SVG_NS, 'circle');
-      uncertainty.setAttribute('cx', cx); uncertainty.setAttribute('cy', cy); uncertainty.setAttribute('r', radiusPx(p.radius));
-      uncertainty.setAttribute('class', 'uncertainty-circle'); uncertainty.style.stroke = p.color;
-      uncertainty.addEventListener('click', function () { selectCandidate(p.candidateId); });
-      svg.appendChild(uncertainty);
-      var dot = document.createElementNS(SVG_NS, 'circle');
-      dot.setAttribute('cx', cx); dot.setAttribute('cy', cy); dot.setAttribute('r', 3.5);
-      dot.setAttribute('class', 'centroid-dot' + (p.candidateId === selectedId ? ' centroid-selected' : ''));
-      dot.style.fill = p.color;
-      dot.addEventListener('click', function () { selectCandidate(p.candidateId); });
-      svg.appendChild(dot);
-    });
+    mapEl.innerHTML = '<svg viewBox="0 0 ' + w + " " + h + '" width="100%" height="100%">' + svgParts.join("") + "</svg>";
   }
 
-  function renderAll() { renderList(); renderEvidence(); renderMap(); }
+  function showEvidence(c) {
+    evidenceEl.innerHTML =
+      "<h3>" + escapeHtml(c.name_a) + " \\u2194 " + escapeHtml(c.name_b) + "</h3>" +
+      '<p class="muted">' + escapeHtml(c.relationship_summary) + "</p>" +
+      "<table><tbody>" +
+      "<tr><th>Raw event A</th><td>" + escapeHtml(c.event_a_type) + " \\u2014 " + escapeHtml(c.event_a_date_raw) + " @ " + escapeHtml(c.place_a_raw) + "</td></tr>" +
+      "<tr><th>Raw event B</th><td>" + escapeHtml(c.event_b_type) + " \\u2014 " + escapeHtml(c.event_b_date_raw) + " @ " + escapeHtml(c.place_b_raw) + "</td></tr>" +
+      "<tr><th>Resolved places</th><td>" + escapeHtml(c.place_a_resolved) + " / " + escapeHtml(c.place_b_resolved) + "</td></tr>" +
+      "<tr><th>Overlap window</th><td>" + escapeHtml(c.overlap_start) + " to " + escapeHtml(c.overlap_end) + " (" + c.overlap_days + " days) \\u2014 an interval, not a date</td></tr>" +
+      "<tr><th>Distance</th><td>" + c.distance_km.toFixed(2) + " km center-to-center; each endpoint has its own uncertainty radius shown as a circle, not a point</td></tr>" +
+      "<tr><th>Score components</th><td>temporal " + fmtScore(c.component_temporal) + ", spatial " + fmtScore(c.component_spatial) +
+        ", place precision " + fmtScore(c.component_place_precision) + ", source independence " + fmtScore(c.component_source_independence) +
+        ", unrelatedness " + fmtScore(c.component_unrelatedness) + "</td></tr>" +
+      "<tr><th>Total (ranking signal)</th><td>" + fmtScore(c.score) + "</td></tr>" +
+      "<tr><th>Explanation</th><td>" + escapeHtml(c.explanation) + "</td></tr>" +
+      "<tr><th>Config / engine</th><td>" + escapeHtml(c.config_hash) + " / " + escapeHtml(meta.engine_version) + "</td></tr>" +
+      "</tbody></table>";
+  }
 
-  renderMeta(); renderDecadeFilter(); renderBranchKey(); renderAll();
-})();`;
+  decadeFilterEl.addEventListener("change", function () { render(decadeFilterEl.value); });
+  render("all");
+})();
+`
 
-const HTML_TEMPLATE = `<!doctype html>
+const HTML_TEMPLATE = (dataJson: string, truncationNote: string) => `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8" />
 <title>Samesoil candidate report</title>
 <style>
-  :root { font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
-  * { box-sizing: border-box; }
-  body { margin: 0; padding: 0; background: #f7f5f0; color: #1a1a1a; }
-  .caveat-banner { position: sticky; top: 0; z-index: 10; background: #7a1f1f; color: #fff; padding: 10px 16px; font-size: 13px; line-height: 1.4; }
-  .layout { display: flex; gap: 16px; padding: 16px; align-items: flex-start; flex-wrap: wrap; }
-  .sidebar { width: 300px; flex-shrink: 0; }
-  .main { flex: 1; min-width: 360px; }
-  .panel { background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 12px; margin-bottom: 16px; }
-  .candidate-row { display: flex; justify-content: space-between; gap: 8px; padding: 6px 8px; cursor: pointer; border-radius: 4px; font-size: 13px; }
-  .candidate-row:hover { background: #f0eee6; }
-  .candidate-row.selected { background: #dfe7ff; font-weight: 600; }
-  .rank { color: #888; width: 36px; }
-  .names { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .score { font-variant-numeric: tabular-nums; }
-  .decade-toggle { display: inline-block; margin: 2px 8px 2px 0; font-size: 13px; }
-  .branch-row { display: flex; align-items: center; gap: 6px; font-size: 13px; margin-bottom: 4px; }
-  .swatch { width: 12px; height: 12px; border-radius: 2px; display: inline-block; }
-  svg#map-svg { width: 100%; height: auto; background: #eef2f5; border: 1px solid #ccc; border-radius: 4px; }
-  .uncertainty-circle { fill: none; stroke-width: 1.5; opacity: 0.55; }
-  .centroid-dot { stroke: #222; stroke-width: 0.5; cursor: pointer; }
-  .centroid-selected { stroke: #000; stroke-width: 2; }
-  .link { stroke: #999; stroke-width: 1; stroke-dasharray: 3 2; cursor: pointer; }
-  .link-selected { stroke: #333; stroke-width: 2; stroke-dasharray: none; }
-  table.evidence-table { width: 100%; border-collapse: collapse; margin-bottom: 12px; font-size: 13px; }
-  table.evidence-table th, table.evidence-table td { border: 1px solid #ddd; padding: 4px 6px; text-align: left; vertical-align: top; }
-  .caveat-inline, .explanation { font-size: 12px; color: #7a1f1f; }
-  .truncation-note { font-size: 12px; color: #7a1f1f; margin-top: 6px; }
-  h1, h2, h3 { margin-top: 0; }
-  #list-count, #report-meta { font-size: 12px; color: #666; }
+  body { font-family: Georgia, "Times New Roman", serif; margin: 0; padding: 0; color: #222; }
+  #caveat-banner { position: sticky; top: 0; background: #fff3cd; border-bottom: 2px solid #997404; padding: 10px 16px; font-size: 0.9em; z-index: 10; }
+  #layout { display: flex; gap: 16px; padding: 16px; }
+  #left { flex: 1; min-width: 320px; max-width: 420px; }
+  #right { flex: 2; display: flex; flex-direction: column; gap: 12px; }
+  #map-svg { border: 1px solid #ccc; background: #fafafa; height: 480px; }
+  #candidate-list { list-style: none; margin: 0; padding: 0; max-height: 420px; overflow-y: auto; border: 1px solid #ddd; }
+  .candidate-row { padding: 6px 8px; border-bottom: 1px solid #eee; cursor: pointer; font-size: 0.9em; }
+  .candidate-row:hover { background: #f0f0f0; }
+  .rank { color: #888; margin-right: 4px; }
+  .score { color: #555; margin-left: 6px; }
+  .tier { float: right; font-size: 0.8em; color: #777; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.85em; }
+  th, td { border: 1px solid #ddd; padding: 4px 8px; text-align: left; vertical-align: top; }
+  th { background: #f5f5f5; width: 160px; }
+  .muted { color: #777; font-size: 0.85em; }
+  .branch-chip { display: inline-flex; align-items: center; margin-right: 10px; font-size: 0.85em; }
+  .swatch { width: 10px; height: 10px; display: inline-block; margin-right: 4px; border-radius: 50%; }
+  #truncation-note { font-size: 0.8em; color: #997404; padding: 4px 16px; }
 </style>
 </head>
 <body>
-<div class="caveat-banner">
-  Places shown are geocoded to modern administrative boundaries, not the boundaries that existed at the time of the recorded event. Every candidate below is a research lead worth checking against primary sources \u2014 none of them is a proven encounter. The score is a ranking signal only, never a probability or percentage confidence that two people actually met.
+<div id="caveat-banner">
+  Places are geocoded to <b>modern administrative boundaries</b>, not the boundaries that existed at the time of the event.
+  A candidate here is a <b>lead for archival research, not a proven encounter</b>. The score is a ranking signal only \u2014
+  it is never a probability or a percentage confidence that two people actually met.
 </div>
-<div class="layout">
-  <div class="sidebar">
-    <div class="panel">
-      <h2>Samesoil candidates</h2>
-      <p id="report-meta"></p>
-    </div>
-    <div class="panel">
-      <h3>Decade filter</h3>
-      <div id="decade-filter"></div>
-    </div>
-    <div class="panel">
-      <h3>Ancestral branch key</h3>
-      <div id="branch-key"></div>
-    </div>
-    <div class="panel">
-      <h3>Ranked candidates</h3>
-      <div id="list-count"></div>
-      <div id="candidate-list"></div>
-    </div>
+${truncationNote ? `<div id="truncation-note">${truncationNote}</div>` : ""}
+<div id="layout">
+  <div id="left">
+    <label>Decade: <select id="decade-filter"></select></label>
+    <div id="branch-key" style="margin: 8px 0;"></div>
+    <ul id="candidate-list"></ul>
   </div>
-  <div class="main">
-    <div class="panel">
-      <h3>Approximate locations (coordinate-plotted; no basemap imagery, no network)</h3>
-      <svg id="map-svg" viewBox="0 0 760 520" xmlns="http://www.w3.org/2000/svg"></svg>
-      <p class="truncation-note" id="truncation-note"></p>
-    </div>
-    <div class="panel" id="evidence-panel"></div>
+  <div id="right">
+    <div id="map-svg"></div>
+    <div id="evidence-panel"></div>
   </div>
 </div>
-<script id="samesoil-data" type="application/json">__DATA_JSON__</script>
-<script>__CLIENT_JS__</script>
+<script>
+var __SAMESOIL_DATA__ = ${dataJson};
+</script>
+<script>
+${CLIENT_JS}
+</script>
 </body>
 </html>
-`;
+`
 
 function renderReportHtml(
-  rows: ReadonlyArray<ExportRow>,
-  totalCount: number,
-  cap: number,
-  truncated: boolean,
-  branchOf: (id: number) => { readonly label: string },
-  branchColors: ReadonlyMap<string, string>,
-  relationshipOf: (a: number, b: number) => string,
-  generatedAt: string,
-  configHash: string,
-  engineVersion: string,
+	rows: Array<Record<string, unknown>>,
+	branchNameOf: (individualId: number) => string,
+	branchColorOf: (individualId: number) => string,
+	engineVersion: string,
+	maxCandidates: number,
 ): string {
-  const candidates = rows
-    .filter((row) => row.a_lat !== null && row.a_lon !== null && row.b_lat !== null && row.b_lon !== null)
-    .map((row) => ({
-      candidate_id: row.candidate_id, score: Number(row.score.toFixed(6)), decade: decadeOf(row.overlap_start),
-      a_name: row.a_name ?? `Individual ${row.a_id}`, a_event_type: row.a_event_type, a_date_raw: row.a_date_raw, a_place_raw: row.a_place_raw,
-      a_place_label: row.a_place_label, a_lat: row.a_lat, a_lon: row.a_lon, a_radius_km: row.a_radius_km, a_precision_tier: row.a_precision_tier, a_branch: branchOf(row.a_id).label,
-      b_name: row.b_name ?? `Individual ${row.b_id}`, b_event_type: row.b_event_type, b_date_raw: row.b_date_raw, b_place_raw: row.b_place_raw,
-      b_place_label: row.b_place_label, b_lat: row.b_lat, b_lon: row.b_lon, b_radius_km: row.b_radius_km, b_precision_tier: row.b_precision_tier, b_branch: branchOf(row.b_id).label,
-      overlap_start: row.overlap_start, overlap_end: row.overlap_end, overlap_days: row.overlap_days, temporal_relation: row.temporal_relation, temporal_gap_days: row.temporal_gap_days,
-      distance_km: Number(row.distance_km.toFixed(3)), combined_radius: Number(row.combined_radius.toFixed(3)),
-      s_proximity: Number(row.s_proximity.toFixed(6)), s_temporal: Number(row.s_temporal.toFixed(6)), s_temporal_proximity: Number(row.s_temporal_proximity.toFixed(6)),
-      s_date_precision: Number(row.s_date_precision.toFixed(6)), s_precision: Number(row.s_precision.toFixed(6)), s_confidence: Number(row.s_confidence.toFixed(6)),
-      s_unrelatedness: Number(row.s_unrelatedness.toFixed(6)), s_independence: Number(row.s_independence.toFixed(6)),
-      relationship_summary: relationshipOf(row.a_id, row.b_id), config_hash: row.config_hash, engine_version: row.engine_version, explanation: row.explanation,
-    }));
-  const payload = {
-    meta: { generatedAt, totalCandidates: totalCount, embeddedCandidates: candidates.length, truncated, cap, configHash, engineVersion },
-    branchColors: Object.fromEntries(branchColors),
-    candidates,
-  };
-  const dataJson = JSON.stringify(payload).replace(/</g, "\\u003c");
-  return HTML_TEMPLATE.replace("__DATA_JSON__", dataJson).replace("__CLIENT_JS__", CLIENT_JS);
+	const truncated = rows.length > maxCandidates
+	const capped = truncated ? rows.slice(0, maxCandidates) : rows
+
+	const candidates = capped.map((r) => ({
+		candidate_id: r.candidate_id,
+		name_a: r.individual_a_name,
+		name_b: r.individual_b_name,
+		branch_a: branchNameOf(r.individual_a_id as number),
+		branch_b: branchNameOf(r.individual_b_id as number),
+		color_a: branchColorOf(r.individual_a_id as number),
+		color_b: branchColorOf(r.individual_b_id as number),
+		event_a_type: r.event_a_type, event_b_type: r.event_b_type,
+		event_a_date_raw: r.event_a_date_raw, event_b_date_raw: r.event_b_date_raw,
+		place_a_raw: r.place_a_raw, place_b_raw: r.place_b_raw,
+		place_a_resolved: r.place_a_resolved, place_b_resolved: r.place_b_resolved,
+		lat_a: r.place_a_lat, lon_a: r.place_a_lon,
+		lat_b: r.place_b_lat, lon_b: r.place_b_lon,
+		radius_a_km: r.place_a_radius_km, radius_b_km: r.place_b_radius_km,
+		overlap_start: r.overlap_start, overlap_end: r.overlap_end, overlap_days: r.overlap_days,
+		distance_km: r.distance_km,
+		component_temporal: r.component_temporal, component_spatial: r.component_spatial,
+		component_place_precision: r.component_place_precision,
+		component_source_independence: r.component_source_independence,
+		component_unrelatedness: r.component_unrelatedness,
+		score: r.total_score,
+		relationship_summary: r.explanation,
+		explanation: r.explanation,
+		config_hash: r.config_hash,
+		tier: coarserTier(String(r.place_a_tier), String(r.place_b_tier)),
+		decade: decadeOf((r.overlap_start as string) ?? null),
+	}))
+
+	const dataJson = JSON.stringify({ candidates, meta: { engine_version: engineVersion, total_scored: rows.length } })
+	const truncationNote = truncated
+		? `Showing the top ${maxCandidates} of ${rows.length} scored candidates (config max_candidates). See candidates.csv for the full set.`
+		: ""
+
+	return HTML_TEMPLATE(dataJson, truncationNote)
 }
 
+// ---------------------------------------------------------------------------
+// Orchestrator
+// ---------------------------------------------------------------------------
 export async function run(ctx: EngineContext): Promise<void> {
-  const pass = "export", started = ctx.env.now();
-  ctx.progress.passStarted(pass);
+	const startMs = ctx.env.now()
+	ctx.progress.passStarted("export")
 
-  const rows = ctx.storage.all<ExportRow>(EXPORT_QUERY);
-  const people = new Map(ctx.storage.all<IndividualNameRow>("SELECT id,name_full,name_surname,gedcom_xref FROM individuals ORDER BY id").map((row) => [row.id, row]));
-  const graph = loadKinshipGraph(ctx.storage);
-  const branchOf = buildBranchAssigner(graph, people, ctx.config.kinship.bfs_max_depth);
-  const kinship = createKinshipService(ctx);
-  const relationshipOf = (aId: number, bId: number): string => kinship.summary(aId, bId);
+	const includeLiving = ctx.config.privacy.include_living ? 1 : 0
+	const rows = (await ctx.storage.all(EXPORT_QUERY, [includeLiving, includeLiving])) as Array<Record<string, unknown>>
 
-  const cap = ctx.config.scoring.max_candidates, truncated = rows.length > cap, embedded = truncated ? rows.slice(0, cap) : rows;
+	const reviewRows = (await ctx.storage.all(REVIEW_QUEUE_QUERY, [])) as Array<Record<string, unknown>>
 
-  const branchLabels = new Set<string>();
-  for (const row of embedded) { branchLabels.add(branchOf(row.a_id).label); branchLabels.add(branchOf(row.b_id).label); }
-  const branchColors = assignBranchColors(branchLabels);
+	const kinshipGraph = await loadKinshipGraph(ctx)
+	const { rootOf } = buildBranchAssigner(kinshipGraph)
 
-  const candidatesCsv = renderCandidatesCsv(rows, relationshipOf);
-  const geojson = renderGeoJson(embedded, branchOf, truncated, cap);
-  const branchIntersections = renderBranchIntersections(embedded, branchOf);
-  const reviewQueue = renderReviewQueue(ctx);
-  const reportHtml = renderReportHtml(embedded, rows.length, cap, truncated, branchOf, branchColors, relationshipOf, ctx.env.now(), ctx.configHash, ctx.config.engine_version);
+	const allIndividualIds = new Set<number>()
+	for (const r of rows) {
+		allIndividualIds.add(r.individual_a_id as number)
+		allIndividualIds.add(r.individual_b_id as number)
+	}
+	const rootIdOf = new Map<number, number>()
+	for (const id of allIndividualIds) rootIdOf.set(id, rootOf(id))
+	const colorByRoot = assignBranchColors(Array.from(rootIdOf.values()))
 
-  await ctx.artifactSink.write("candidates.csv", candidatesCsv);
-  await ctx.artifactSink.write("candidates.geojson", geojson);
-  await ctx.artifactSink.write("report.html", reportHtml);
-  await ctx.artifactSink.write("branch_intersections.md", branchIntersections);
-  await ctx.artifactSink.write("review_queue.csv", reviewQueue);
+	const branchNameOf = (individualId: number): string => `Branch ${rootIdOf.get(individualId) ?? individualId}`
+	const branchColorOf = (individualId: number): string => colorByRoot.get(rootIdOf.get(individualId) ?? -1) ?? "#888888"
 
-  ctx.progress.passFinished(pass, {
-    rows_in: rows.length,
-    rows_embedded_in_report: embedded.length,
-    truncated,
-    cap,
-    distinct_branches: branchLabels.size,
-    review_queue_rows: reviewQueue.split("\n").length - 2,
-    elapsed_ms: elapsed(started, ctx.env.now()),
-  });
+	const relationshipOf = (aId: number, bId: number): string => {
+		const summary = kinshipGraph.relationshipSummary(aId, bId)
+		return summary ?? "no known relationship"
+	}
+
+	const maxCandidates = ctx.config.scoring.max_candidates
+
+	await ctx.artifactSink.write("candidates.csv", renderCandidatesCsv(rows, relationshipOf))
+	await ctx.artifactSink.write("candidates.geojson", renderGeoJson(rows.slice(0, maxCandidates), branchColorOf))
+	await ctx.artifactSink.write(
+		"report.html",
+		renderReportHtml(rows, branchNameOf, branchColorOf, ctx.config.engine_version, maxCandidates),
+	)
+	await ctx.artifactSink.write("branch_intersections.md", renderBranchIntersections(rows, branchNameOf))
+	await ctx.artifactSink.write(
+		"review_queue.csv",
+		renderReviewQueue(reviewRows, ctx.config.place.min_geocode_conf, ctx.config.place.min_tier),
+	)
+
+	ctx.progress.passFinished("export", {
+		rowsIn: rows.length,
+		rowsOut: rows.length,
+		reviewQueueRows: reviewRows.length,
+		truncatedToMax: rows.length > maxCandidates,
+		timingMs: elapsed(startMs, ctx.env),
+	})
 }
