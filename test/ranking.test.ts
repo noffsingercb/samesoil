@@ -1,0 +1,7 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { selectCandidates } from "../src/core/ranking.js";
+interface Row { readonly candidateId: number; readonly aId: number; readonly bId: number; readonly localityKey: string; readonly score: number }
+test("ranking keeps only the strongest candidate for each person pair", () => { const rows: Row[] = [{ candidateId: 2, aId: 1, bId: 3, localityKey: "a", score: 0.8 }, { candidateId: 1, aId: 3, bId: 1, localityKey: "a", score: 0.9 }], result = selectCandidates(rows, 10, 10); assert.deepEqual(result.kept.map((row) => row.candidateId), [1]); assert.deepEqual(result.duplicates, [{ row: rows[0], keptCandidateId: 1 }]); });
+test("ranking caps localities and fills from less saturated places", () => { const rows: Row[] = [{ candidateId: 1, aId: 1, bId: 2, localityKey: "city", score: 0.9 }, { candidateId: 2, aId: 3, bId: 4, localityKey: "city", score: 0.8 }, { candidateId: 3, aId: 5, bId: 6, localityKey: "town", score: 0.7 }], result = selectCandidates(rows, 2, 1); assert.deepEqual(result.kept.map((row) => row.candidateId), [1, 3]); assert.deepEqual(result.localityLimited.map((row) => row.candidateId), [2]); });
+test("ranking remains deterministic at equal scores", () => { const rows: Row[] = [{ candidateId: 9, aId: 1, bId: 2, localityKey: "a", score: 0.5 }, { candidateId: 4, aId: 3, bId: 5, localityKey: "b", score: 0.5 }], result = selectCandidates(rows, 1, 10); assert.equal(result.kept[0]?.candidateId, 4); assert.equal(result.belowLimit[0]?.candidateId, 9); });
