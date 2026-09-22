@@ -1,0 +1,8 @@
+{
+  "schema_version":"0.3.0",
+  "qa":{
+    "minimum_false_positive_cases":15,
+    "required_reasons":["same_individual","living","duplicate_identity","nonoverlapping_lifespans","inferred_open_date","spouse","same_household","close_kin","in_law","recent_mrca","same_branch","coarse_place","low_conf"],
+    "monotonicity":{"place":true,"date":true,"distance":true,"unrelatedness":true}
+  }
+}

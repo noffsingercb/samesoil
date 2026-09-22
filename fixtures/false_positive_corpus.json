@@ -1,0 +1,19 @@
+[
+  {"pair":["Same Record A","Same Record A"],"relationship":"same individual","must_suppress":true,"reason":"same_individual","flags":{"sameIndividual":true}},
+  {"pair":["Living A","Historical B"],"relationship":"living person","must_suppress":true,"reason":"living","flags":{"living":true}},
+  {"pair":["Duplicate A","Duplicate B"],"relationship":"duplicate identity","must_suppress":true,"reason":"duplicate_identity","flags":{"duplicateIdentity":true}},
+  {"pair":["Died First","Born Later"],"relationship":"nonoverlapping lifespans","must_suppress":true,"reason":"nonoverlapping_lifespans","flags":{"nonOverlappingLifespans":true}},
+  {"pair":["Before Unknown","After Unknown"],"relationship":"fallback open interval","must_suppress":true,"reason":"inferred_open_date","flags":{"inferredOpenDate":true}},
+  {"pair":["Spouse A","Spouse B"],"relationship":"spouses","must_suppress":true,"reason":"spouse","flags":{"directSpouse":true}},
+  {"pair":["Boarder A","Boarder B"],"relationship":"same census household","must_suppress":true,"reason":"same_household","flags":{"sameHousehold":true}},
+  {"pair":["Parent","Child"],"relationship":"first-degree blood kin","must_suppress":true,"reason":"close_kin","flags":{"bloodDegree":1}},
+  {"pair":["Sibling A","Sibling B"],"relationship":"siblings","must_suppress":true,"reason":"close_kin","flags":{"bloodDegree":2}},
+  {"pair":["Grandparent","Grandchild"],"relationship":"second-degree blood kin","must_suppress":true,"reason":"close_kin","flags":{"bloodDegree":2}},
+  {"pair":["First Cousin A","First Cousin B"],"relationship":"close blood kin","must_suppress":true,"reason":"close_kin","flags":{"bloodDegree":4}},
+  {"pair":["In-law A","In-law B"],"relationship":"short marriage path","must_suppress":true,"reason":"in_law","flags":{"graphDegree":3}},
+  {"pair":["MRCA A","MRCA B"],"relationship":"recent shared ancestor","must_suppress":true,"reason":"recent_mrca","flags":{"sharedMrcaWithinCutoff":true}},
+  {"pair":["Branch A","Branch B"],"relationship":"same branch","must_suppress":true,"reason":"same_branch","flags":{"sameBranch":true,"branchDegree":5}},
+  {"pair":["County A","County B"],"relationship":"coarse place only","must_suppress":true,"reason":"coarse_place","flags":{"coarsePlace":true}},
+  {"pair":["Weak A","Weak B"],"relationship":"low-confidence evidence","must_suppress":true,"reason":"low_conf","flags":{"lowConfidence":true}},
+  {"pair":["Living Spouse A","Living Spouse B"],"relationship":"privacy precedence","must_suppress":true,"reason":"living","flags":{"living":true,"directSpouse":true,"sameHousehold":true}}
+]
