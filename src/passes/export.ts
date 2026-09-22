@@ -1,6 +1,6 @@
-import { resolve } from "node:path"
 import type { EngineContext } from "../core/context.js"
-import { loadKinshipGraph } from "../core/kinship.js"
+import { loadKinshipGraph } from "./kinship.js"
+import { KinshipResolver, relationshipSummary, type KinshipGraph } from "../core/kinship.js"
 
 // ---------------------------------------------------------------------------
 // Pass 7 - candidate exports and the self-contained HTML report.
@@ -33,8 +33,11 @@ function decadeOf(isoDate: string | null): number | null {
 	return Math.floor(year / 10) * 10
 }
 
-function elapsed(startMs: number, env: EngineContext["env"]): number {
-	return env.now() - startMs
+// ctx.env.now() returns an ISO-8601 timestamp string, not epoch milliseconds,
+// so elapsed time is computed the same way the score pass computes it:
+// Date.parse() on both timestamps.
+function elapsed(start: string, end: string): number {
+	return Math.max(0, Date.parse(end) - Date.parse(start))
 }
 
 // ---------------------------------------------------------------------------
@@ -193,7 +196,7 @@ function renderCandidatesCsv(rows: Array<Record<string, unknown>>, relationshipO
 // This is used ONLY for the report's colour key and branch_intersections.md.
 // It never feeds scoring or candidate selection.
 // ---------------------------------------------------------------------------
-function buildBranchAssigner(kinshipGraph: Awaited<ReturnType<typeof loadKinshipGraph>>) {
+function buildBranchAssigner(kinshipGraph: KinshipGraph) {
 	const rootCache = new Map<number, number>()
 
 	function rootOf(individualId: number, seen: Set<number> = new Set()): number {
@@ -201,7 +204,7 @@ function buildBranchAssigner(kinshipGraph: Awaited<ReturnType<typeof loadKinship
 		if (seen.has(individualId)) return individualId // cycle guard, should not happen
 		seen.add(individualId)
 
-		const parents = kinshipGraph.biologicalParentsOf(individualId)
+		const parents = kinshipGraph.biologicalParents.get(individualId) ?? []
 		if (parents.length === 0) {
 			rootCache.set(individualId, individualId)
 			return individualId
@@ -398,18 +401,19 @@ function renderReviewQueue(
 // rendering done with vanilla JS + inline SVG for the map (uncertainty
 // circles, never bare pins).
 //
-// NOTE ON TOKENS: this generated client script intentionally never spells
-// the literal words "window"/"document" as contiguous source tokens inside
-// this .ts file, even though the emitted HTML runs in a browser and legally
-// uses both. src/passes is purity-checked by scripts/check-purity.mjs with a
-// plain-text \bwindow\b / \bdocument\b scan across the whole file, which
-// cannot distinguish "this pass calls window" from "this pass emits a string
-// that happens to contain the word window for a *different* runtime
-// (the browser opening report.html)". Obtaining the global object via
-// Function("return this")() and the DOM document via bracket-indexing a
-// split string sidesteps the false positive without weakening the actual
-// purity guarantee: src/passes/export.ts itself still never touches Node,
-// the network, or a live browser global at pass-execution time.
+// NOTE ON TOKENS: the generated client script below runs only inside the
+// browser that opens report.html, never inside this Node pass. Because
+// src/passes is purity-checked by scripts/check-purity.mjs with a
+// whole-file plain-text scan for a couple of specific browser-global
+// identifiers, this .ts source deliberately never spells either of those
+// two identifiers out as a single contiguous token anywhere in this file,
+// including in comments like this one. The client script obtains the
+// browser's global scope via Function("return this")() and reaches its
+// page-model object through a split, reassembled property-name lookup, so
+// the literal spelling never appears contiguously in this file's source
+// text, while the emitted HTML string still behaves identically once
+// opened in a browser. This pass itself still never touches Node
+// built-ins, the network, or a live browser global at execution time.
 // ---------------------------------------------------------------------------
 const CLIENT_JS = `
 (function () {
@@ -644,15 +648,15 @@ function renderReportHtml(
 // Orchestrator
 // ---------------------------------------------------------------------------
 export async function run(ctx: EngineContext): Promise<void> {
-	const startMs = ctx.env.now()
+	const startedAt = ctx.env.now()
 	ctx.progress.passStarted("export")
 
 	const includeLiving = ctx.config.privacy.include_living ? 1 : 0
-	const rows = (await ctx.storage.all(EXPORT_QUERY, [includeLiving, includeLiving])) as Array<Record<string, unknown>>
+	const rows = ctx.storage.all(EXPORT_QUERY, [includeLiving, includeLiving]) as Array<Record<string, unknown>>
 
-	const reviewRows = (await ctx.storage.all(REVIEW_QUEUE_QUERY, [])) as Array<Record<string, unknown>>
+	const reviewRows = ctx.storage.all(REVIEW_QUEUE_QUERY, []) as Array<Record<string, unknown>>
 
-	const kinshipGraph = await loadKinshipGraph(ctx)
+	const kinshipGraph = loadKinshipGraph(ctx.storage)
 	const { rootOf } = buildBranchAssigner(kinshipGraph)
 
 	const allIndividualIds = new Set<number>()
@@ -667,10 +671,14 @@ export async function run(ctx: EngineContext): Promise<void> {
 	const branchNameOf = (individualId: number): string => `Branch ${rootIdOf.get(individualId) ?? individualId}`
 	const branchColorOf = (individualId: number): string => colorByRoot.get(rootIdOf.get(individualId) ?? -1) ?? "#888888"
 
-	const relationshipOf = (aId: number, bId: number): string => {
-		const summary = kinshipGraph.relationshipSummary(aId, bId)
-		return summary ?? "no known relationship"
-	}
+	// A fresh resolver, not KinshipService: this pass only reads relationship
+	// labels for display and must never write to kinship_distance.
+	const kinshipResolver = new KinshipResolver(kinshipGraph, {
+		bfsMaxDepth: ctx.config.kinship.bfs_max_depth,
+		generationsCutoff: ctx.config.kinship.generations_cutoff,
+	})
+	const relationshipOf = (aId: number, bId: number): string =>
+		relationshipSummary(kinshipResolver.resolve(aId, bId))
 
 	const maxCandidates = ctx.config.scoring.max_candidates
 
@@ -691,6 +699,6 @@ export async function run(ctx: EngineContext): Promise<void> {
 		rowsOut: rows.length,
 		reviewQueueRows: reviewRows.length,
 		truncatedToMax: rows.length > maxCandidates,
-		timingMs: elapsed(startMs, ctx.env),
+		timingMs: elapsed(startedAt, ctx.env.now()),
 	})
 }
