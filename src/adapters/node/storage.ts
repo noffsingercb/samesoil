@@ -1,9 +1,12 @@
+import { mkdirSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import Database from "better-sqlite3";
 import type { RunResult, SqlParameters, SqlRow, StorageAdapter } from "../../core/adapters.js";
 
 export class NodeStorageAdapter implements StorageAdapter {
   readonly #database: Database.Database;
   public constructor(path: string) {
+    if (path !== ":memory:") mkdirSync(dirname(resolve(path)), { recursive: true });
     this.#database = new Database(path);
     this.#database.pragma("foreign_keys = ON");
   }
